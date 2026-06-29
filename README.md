@@ -3,7 +3,7 @@
 Find which flake input causes a Nix evaluation warning or trace.
 
 ```sh
-nix run github:aniviaflome/nixgrep -- scan /path/to/your/nix-config
+nix run github:AniviaFlome/nixgrep -- scan /path/to/your/nix-config
 ```
 
 ## Commands
