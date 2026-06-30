@@ -150,11 +150,27 @@ pub fn default_capture_target(flake: &str, host_hint: Option<&str>) -> Option<St
 ///   3. `nixosConfigurations.<host>.config.environment.systemPackages`
 ///
 /// Returns an attr path relative to the flake (no `#`).
+///
+/// Prefer [`default_trigger_targets`] (plural) for `scan`, which returns *all*
+/// existing candidate paths so every consumer of a warned package can be
+/// attributed, not just the first one found.
+#[allow(dead_code)]
 pub fn default_trigger_target(flake: &str, host: &str) -> Option<String> {
+    default_trigger_targets(flake, host).into_iter().next()
+}
+
+/// Auto-detect *all* candidate trigger targets for Mode B.
+///
+/// Returns every attribute path from the probe list that exists in the flake,
+/// in priority order (editor extension lists first, then `home.packages`,
+/// then `environment.systemPackages`). Each path is relative to the flake
+/// (no `#`). See [`default_trigger_target`] for the single-target variant.
+pub fn default_trigger_targets(flake: &str, host: &str) -> Vec<String> {
     let cfg = format!("nixosConfigurations.{host}.config");
     let editors = ["vscode", "vscodium", "vscode-fhs", "cursor"];
 
     let hm_users = list_attr(flake, &format!("{cfg}.home-manager.users")).ok();
+    let mut out = Vec::new();
 
     if let Some(users) = &hm_users {
         for u in users {
@@ -162,11 +178,11 @@ pub fn default_trigger_target(flake: &str, host: &str) -> Option<String> {
             for ed in editors {
                 let path = format!("{hm}.programs.{ed}.profiles.default.extensions");
                 if attr_exists(flake, &path) {
-                    return Some(path);
+                    out.push(path);
                 }
                 let path = format!("{hm}.programs.{ed}.extensions");
                 if attr_exists(flake, &path) {
-                    return Some(path);
+                    out.push(path);
                 }
             }
         }
@@ -176,17 +192,17 @@ pub fn default_trigger_target(flake: &str, host: &str) -> Option<String> {
         for u in users {
             let path = format!("{cfg}.home-manager.users.{u}.home.packages");
             if attr_exists(flake, &path) {
-                return Some(path);
+                out.push(path);
             }
         }
     }
 
     let sys = format!("{cfg}.environment.systemPackages");
     if attr_exists(flake, &sys) {
-        return Some(sys);
+        out.push(sys);
     }
 
-    None
+    out
 }
 
 /// Return true if `flake#<attr>` evaluates without error.

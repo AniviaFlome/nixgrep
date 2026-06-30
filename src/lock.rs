@@ -320,13 +320,12 @@ mod tests {
             c.url("pkgs/vscode/package.nix", Some(18)).as_deref(),
             Some("https://github.com/catppuccin/nix/blob/abc/pkgs/vscode/package.nix#L18")
         );
-        assert!(
-            g.inputs
-                .get("catppuccin.nixpkgs")
-                .unwrap()
-                .url("a.nix", Some(1))
-                .is_none()
-        );
+        assert!(g
+            .inputs
+            .get("catppuccin.nixpkgs")
+            .unwrap()
+            .url("a.nix", Some(1))
+            .is_none());
     }
 
     #[test]

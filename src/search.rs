@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{SearcherBuilder, sinks::UTF8};
+use grep_searcher::{sinks::UTF8, SearcherBuilder};
 use walkdir::WalkDir;
 
 use crate::archive::ArchiveTree;

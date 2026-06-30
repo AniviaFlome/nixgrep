@@ -50,13 +50,20 @@ fn strip_ansi(s: &str) -> String {
 }
 
 fn strip_nix_prefix(s: &str) -> String {
-    let trimmed = s.trim_start();
-    for p in ["evaluation warning:", "warning:", "trace:"] {
-        if let Some(rest) = trimmed.strip_prefix(p) {
-            return rest.trim_start().to_string();
+    let mut trimmed = s.trim_start();
+    loop {
+        let mut stripped = false;
+        for p in ["evaluation warning:", "warning:", "trace:"] {
+            if let Some(rest) = trimmed.strip_prefix(p) {
+                trimmed = rest.trim_start();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            return trimmed.to_string();
         }
     }
-    trimmed.to_string()
 }
 
 /// Heuristically pick the best literal needle for grepping source.
@@ -99,6 +106,15 @@ mod tests {
     #[test]
     fn strips_evaluation_warning_prefix() {
         let n = normalize("evaluation warning: pnpm: Override nodejs-slim instead of nodejs");
+        assert_eq!(n.message, "pnpm: Override nodejs-slim instead of nodejs");
+        assert_eq!(n.needle, "pnpm: Override nodejs-slim instead of nodejs");
+        assert!(!n.partial);
+    }
+
+    #[test]
+    fn strips_trace_and_evaluation_warning_prefix() {
+        let n =
+            normalize("trace: evaluation warning: pnpm: Override nodejs-slim instead of nodejs");
         assert_eq!(n.message, "pnpm: Override nodejs-slim instead of nodejs");
         assert_eq!(n.needle, "pnpm: Override nodejs-slim instead of nodejs");
         assert!(!n.partial);

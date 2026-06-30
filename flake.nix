@@ -3,6 +3,10 @@
 
   inputs = {
     nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1";
+    fenix = {
+      url = "https://flakehub.com/f/nix-community/fenix/0.1";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     naersk = {
       url = "https://flakehub.com/f/nix-community/naersk/0.1";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -48,6 +52,21 @@
       );
     in
     {
+      overlays.default = final: prev: {
+        rustToolchain =
+          with inputs.fenix.packages.${prev.stdenv.hostPlatform.system};
+          combine (
+            with stable;
+            [
+              clippy
+              rustc
+              cargo
+              rustfmt
+              rust-src
+            ]
+          );
+      };
+
       devShells = forEachSupportedSystem (
         { pkgs, ... }:
         {

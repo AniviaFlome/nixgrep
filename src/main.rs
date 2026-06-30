@@ -502,17 +502,27 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
         return Ok(());
     }
 
-    let trigger_target = args.trigger_target.clone().or_else(|| {
-        let host = resolved_target
-            .as_deref()
-            .and_then(extract_host_from_target)
-            .or_else(|| host_hint.clone());
-        host.and_then(|h| scan::default_trigger_target(&base_flake, &h))
-    });
-    if let Some(t) = &trigger_target {
-        if args.trigger_target.is_none() {
-            writeln_info(out, &format!("auto-detected trigger target: {t}"))?;
+    let trigger_targets: Vec<String> = match &args.trigger_target {
+        Some(t) => vec![t.clone()],
+        None => {
+            let host = resolved_target
+                .as_deref()
+                .and_then(extract_host_from_target)
+                .or_else(|| host_hint.clone());
+            match host {
+                Some(h) => scan::default_trigger_targets(&base_flake, &h),
+                None => Vec::new(),
+            }
         }
+    };
+    if !trigger_targets.is_empty() && args.trigger_target.is_none() {
+        writeln_info(
+            out,
+            &format!(
+                "auto-detected trigger target(s): {}",
+                trigger_targets.join(", ")
+            ),
+        )?;
     }
 
     let project_root = Some(std::path::Path::new(&base_flake).to_path_buf());
@@ -545,17 +555,37 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
         }
         let hits = search::search(project_root.as_deref(), &tree, &norm, &opts).unwrap_or_default();
 
-        let triggers = if let Some(trigger_target) = &trigger_target {
-            let nix_args = vec!["eval".to_string(), trigger_target.clone()];
-            Some(meta::collect(
-                &nix_args,
-                &base_flake,
-                &norm,
-                &tree,
-                project_root.as_deref(),
-            ))
-        } else {
+        let triggers = if trigger_targets.is_empty() {
             None
+        } else {
+            let mut merged: Vec<meta::MetaTrigger> = Vec::new();
+            let mut first_err: Option<anyhow::Error> = None;
+            for target in &trigger_targets {
+                let nix_args = vec!["eval".to_string(), target.clone()];
+                match meta::collect(
+                    &nix_args,
+                    &base_flake,
+                    &norm,
+                    &tree,
+                    project_root.as_deref(),
+                ) {
+                    Ok(mut ts) => merged.append(&mut ts),
+                    Err(e) if first_err.is_none() => first_err = Some(e),
+                    Err(_) => {}
+                }
+            }
+            // Dedupe triggers that appear in multiple target paths (e.g. the
+            // same vscode extension surfaced via `programs.vscode...extensions`
+            // and `programs.vscodium...extensions`). Key on (file, line, name)
+            // so distinct derivations at the same site are both kept.
+            let mut seen: std::collections::HashSet<(std::path::PathBuf, Option<u64>, String)> =
+                std::collections::HashSet::new();
+            merged.retain(|t| seen.insert((t.file.clone(), t.line, t.name.clone())));
+            if merged.is_empty() && first_err.is_some() {
+                Some(Err(first_err.unwrap()))
+            } else {
+                Some(Ok(merged))
+            }
         };
 
         results.push(ScanResult {
@@ -619,7 +649,8 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
         let triggers_ok: Vec<_> = match &r.triggers {
             Some(Ok(ts)) => ts
                 .iter()
-                .filter(|t| !is_nixpkgs_internal(&t.attribution))
+                .filter(|t| !is_emitter_internal(t, &r.hits))
+                .filter(|t| is_relevant_trigger(t, &r.hits))
                 .cloned()
                 .collect(),
             _ => Vec::new(),
@@ -773,8 +804,10 @@ fn source_url(
 
 /// True if an attribution refers to a nixpkgs copy (a derivation defined
 /// *inside* nixpkgs, not the consuming input). These are `input nixpkgs`,
-/// `input foo.nixpkgs`, `input foo.nixpkgs-lib`, etc. Such "triggers" are
-/// nixpkgs-internal package definitions and not the real consumer.
+/// `input foo.nixpkgs`, `input foo.nixpkgs-lib`, etc. Currently used only by
+/// tests; the live trigger filter is [`is_relevant_trigger`] which subsumes
+/// this check.
+#[allow(dead_code)]
 fn is_nixpkgs_internal(attr: &str) -> bool {
     let Some(input) = attr.strip_prefix("input ") else {
         return false;
@@ -784,6 +817,83 @@ fn is_nixpkgs_internal(attr: &str) -> bool {
         || input.ends_with(".nixpkgs-lib")
         || input == "nixpkgs-stable"
         || input.ends_with(".nixpkgs-stable")
+}
+
+/// A trigger is "emitter-internal" (and should be dropped from the trigger
+/// list) when it points at the *same file* as one of the Mode A emitter hits.
+///
+/// A nixpkgs-defined package like vesktop has `meta.position` inside nixpkgs
+/// (`pkgs/by-name/ve/vesktop/package.nix`) and is a *real* consumer of pnpm,
+/// so dropping every nixpkgs-located trigger (as [`is_nixpkgs_internal`] did)
+/// throws away real consumers. Instead we only drop a trigger when its file
+/// is the emitting file itself — i.e. the trigger is the `lib.warn` site,
+/// not a caller of it.
+fn is_emitter_internal(t: &meta::MetaTrigger, hits: &[search::Hit]) -> bool {
+    hits.iter().any(|h| h.file == t.file)
+}
+
+/// A trigger is "relevant" when it plausibly consumes the warned package.
+///
+/// We derive the warned package name from the emitter hit path (e.g.
+/// `.../pkgs/development/tools/pnpm/generic.nix` → `pnpm`) and keep only
+/// triggers whose source file mentions that name. This drops noise like
+/// `kate`, `glib`, `zed-editor`, `hm-session-vars` while keeping real
+/// consumers like `vesktop` and `catppuccin-vscode` (whose package files
+/// reference `pnpm`).
+///
+/// When no emitter hits are available (Mode A found nothing) or the package
+/// name can't be derived, all triggers are kept — the filter only narrows
+/// when there's a concrete emitter to match against.
+fn is_relevant_trigger(t: &meta::MetaTrigger, hits: &[search::Hit]) -> bool {
+    let Some(pkg) = warned_package_name(hits) else {
+        return true;
+    };
+    if is_nixpkgs_registrar(&t.file) {
+        return false;
+    }
+    file_mentions(&t.file, &pkg)
+}
+
+/// True for nixpkgs top-level registrar files (e.g. `pkgs/top-level/all-packages.nix`).
+///
+/// These files wire up every package in nixpkgs via `callPackage`, so they
+/// mention every package name without *consuming* any of them. A trigger
+/// whose `meta.position` lands here (e.g. `libressl`'s position is
+/// `all-packages.nix:2605`) is a false positive — the file mentions `pnpm`
+/// only because it registers the pnpm attribute aliases. Excluding these
+/// keeps real consumers (vesktop, catppuccin) which reference pnpm in their
+/// own `nativeBuildInputs`.
+fn is_nixpkgs_registrar(file: &std::path::Path) -> bool {
+    file.to_string_lossy()
+        .contains("/pkgs/top-level/all-packages.nix")
+}
+
+/// Derive the warned package's name from the emitter hit file path.
+///
+/// Emitter files live under `<nixpkgs>/pkgs/.../<pkg>/generic.nix` or
+/// `<nixpkgs>/pkgs/by-name/<ab>/<pkg>/package.nix`; the directory name
+/// directly above the leaf file is the package name.
+fn warned_package_name(hits: &[search::Hit]) -> Option<String> {
+    for h in hits {
+        if let Some(name) = h
+            .file
+            .parent()
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// True if `file` contains `needle` as a substring on any line (best-effort:
+/// returns false on read errors).
+fn file_mentions(file: &std::path::Path, needle: &str) -> bool {
+    std::fs::read_to_string(file)
+        .map(|s| s.contains(needle))
+        .unwrap_or(false)
 }
 
 struct ScanResult {
@@ -997,6 +1107,157 @@ mod tests {
         assert!(!is_nixpkgs_internal("input catppuccin"));
         assert!(!is_nixpkgs_internal("your config"));
         assert!(!is_nixpkgs_internal("unknown"));
+    }
+
+    #[test]
+    fn emitter_internal_drops_coincident_file() {
+        use std::path::Path;
+        let hit = search::Hit {
+            attribution: "input nixpkgs".into(),
+            file: Path::new("/nix/store/abc-source/pkgs/development/tools/pnpm/generic.nix")
+                .to_path_buf(),
+            line_no: 28,
+            line: r#"lib.warn "pnpm: Override nodejs-slim instead of nodejs" nodejs;"#.into(),
+        };
+        let t = meta::MetaTrigger {
+            name: "pnpm-10.29.2".into(),
+            file: Path::new("/nix/store/abc-source/pkgs/development/tools/pnpm/generic.nix")
+                .to_path_buf(),
+            line: Some(28),
+            attribution: "input nixpkgs".into(),
+        };
+        assert!(is_emitter_internal(&t, std::slice::from_ref(&hit)));
+    }
+
+    #[test]
+    fn emitter_internal_keeps_distinct_file() {
+        use std::path::Path;
+        let hit = search::Hit {
+            attribution: "input nixpkgs".into(),
+            file: Path::new("/nix/store/abc-source/pkgs/development/tools/pnpm/generic.nix")
+                .to_path_buf(),
+            line_no: 28,
+            line: r#"lib.warn "pnpm: Override nodejs-slim instead of nodejs" nodejs;"#.into(),
+        };
+        let t = meta::MetaTrigger {
+            name: "vesktop-1.6.5".into(),
+            file: Path::new("/nix/store/abc-source/pkgs/by-name/ve/vesktop/package.nix")
+                .to_path_buf(),
+            line: Some(1),
+            attribution: "input nixpkgs".into(),
+        };
+        assert!(!is_emitter_internal(&t, std::slice::from_ref(&hit)));
+    }
+
+    #[test]
+    fn warned_package_name_from_emitter_path() {
+        use std::path::Path;
+        let hit = search::Hit {
+            attribution: "input nixpkgs".into(),
+            file: Path::new("/nix/store/abc-source/pkgs/development/tools/pnpm/generic.nix")
+                .to_path_buf(),
+            line_no: 28,
+            line: String::new(),
+        };
+        assert_eq!(
+            warned_package_name(std::slice::from_ref(&hit)),
+            Some("pnpm".into())
+        );
+    }
+
+    #[test]
+    fn warned_package_name_from_by_name_path() {
+        use std::path::Path;
+        let hit = search::Hit {
+            attribution: "input nixpkgs".into(),
+            file: Path::new("/nix/store/abc-source/pkgs/by-name/ve/vesktop/package.nix")
+                .to_path_buf(),
+            line_no: 1,
+            line: String::new(),
+        };
+        assert_eq!(
+            warned_package_name(std::slice::from_ref(&hit)),
+            Some("vesktop".into()),
+        );
+    }
+
+    #[test]
+    fn warned_package_name_none_when_no_hits() {
+        assert_eq!(warned_package_name(&[]), None);
+    }
+
+    #[test]
+    fn is_relevant_trigger_keeps_when_no_emitter_hits() {
+        use std::path::Path;
+        let t = meta::MetaTrigger {
+            name: "foo".into(),
+            file: Path::new("/tmp/nonexistent-xyz/foo.nix").to_path_buf(),
+            line: None,
+            attribution: "input nixpkgs".into(),
+        };
+        assert!(is_relevant_trigger(&t, &[]));
+    }
+
+    #[test]
+    fn is_relevant_trigger_keeps_when_file_mentions_package() {
+        use std::path::Path;
+        let dir = std::env::temp_dir().join(format!(
+            "nixgrep-rel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("package.nix");
+        std::fs::write(&file, "buildInputs = [ pnpm ];\n").unwrap();
+        let hit = search::Hit {
+            attribution: "input nixpkgs".into(),
+            file: Path::new("/nix/store/abc-source/pkgs/development/tools/pnpm/generic.nix")
+                .to_path_buf(),
+            line_no: 28,
+            line: String::new(),
+        };
+        let t = meta::MetaTrigger {
+            name: "my-pkg".into(),
+            file: file.clone(),
+            line: Some(1),
+            attribution: "input nixpkgs".into(),
+        };
+        assert!(is_relevant_trigger(&t, std::slice::from_ref(&hit)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_relevant_trigger_drops_when_file_does_not_mention_package() {
+        use std::path::Path;
+        let dir = std::env::temp_dir().join(format!(
+            "nixgrep-rel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("package.nix");
+        std::fs::write(&file, "buildInputs = [ cmake ];\n").unwrap();
+        let hit = search::Hit {
+            attribution: "input nixpkgs".into(),
+            file: Path::new("/nix/store/abc-source/pkgs/development/tools/pnpm/generic.nix")
+                .to_path_buf(),
+            line_no: 28,
+            line: String::new(),
+        };
+        let t = meta::MetaTrigger {
+            name: "my-pkg".into(),
+            file: file.clone(),
+            line: Some(1),
+            attribution: "input nixpkgs".into(),
+        };
+        assert!(!is_relevant_trigger(&t, std::slice::from_ref(&hit)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
