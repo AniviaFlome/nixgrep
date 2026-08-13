@@ -280,7 +280,8 @@ fn pick_host(hosts: &[String], hostname: Option<&str>) -> Option<String> {
 ///
 /// | form              | stderr line                                            | kind    |
 /// |-------------------|--------------------------------------------------------|---------|
-/// | `lib.warn`/`builtins.warn` | `trace: evaluation warning: <msg>` (or `evaluation warning: <msg>` on newer Nix) | Warning  |
+/// | `lib.warn` (via `builtins.trace`) | `trace: evaluation warning: <msg>` (or `evaluation warning: <msg>`) | Warning  |
+/// | `builtins.warn` (newer Nix)       | `warning: <msg>`                          | Warning  |
 /// | `builtins.trace`/`lib.trace` | `trace: <msg>`                                  | Trace   |
 /// | `abort`           | `error: evaluation aborted with the following error message: '<msg>'` | Abort |
 /// | `assert` (failed) | `error: assertion failed`                             | Assert  |
@@ -289,17 +290,21 @@ fn pick_host(hosts: &[String], hostname: Option<&str>) -> Option<String> {
 /// prefix, so its message is indistinguishable from a generic Nix-tool `error:`
 /// line. Pass a throw message explicitly to `nixgrep locate` to attribute it.
 ///
-/// We deliberately drop plain `warning: ...` lines from Nix-the-tool (e.g.
-/// substitute signature warnings) and generic `error:` lines that aren't one
-/// of the fixed-prefix forms above.
+/// Plain `warning:` lines are captured too (newer Nix emits `builtins.warn` as
+/// `warning: <msg>` without the `evaluation warning:` prefix), but we filter
+/// out known Nix-the-tool warnings (substitute/download/git/cache operations)
+/// via [`is_nix_tool_warning`] to avoid noise. Generic `error:` lines that
+/// aren't one of the fixed-prefix forms above are also dropped.
 fn extract_eval_warnings(stderr: &str) -> Vec<CapturedWarning> {
     static RE_WARN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE_WARN_PLAIN: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static RE_TRACE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static RE_ABORT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static RE_ASSERT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 
     let re_warn =
         RE_WARN.get_or_init(|| Regex::new(r"^(?:trace:\s*)?evaluation warning:\s*(.+)$").unwrap());
+    let re_warn_plain = RE_WARN_PLAIN.get_or_init(|| Regex::new(r"^warning:\s*(.+)$").unwrap());
     let re_trace = RE_TRACE.get_or_init(|| Regex::new(r"^trace:\s+(.+)$").unwrap());
     let re_abort = RE_ABORT.get_or_init(|| {
         Regex::new(r"^\s*error:\s+evaluation aborted with the following error message:\s*'(.*)'$")
@@ -313,6 +318,13 @@ fn extract_eval_warnings(stderr: &str) -> Vec<CapturedWarning> {
         let stripped = strip_ansi(line);
         if let Some(caps) = re_warn.captures(&stripped) {
             out.push(make(&stripped, caps.get(1), DiagnosticKind::Warning));
+            continue;
+        }
+        if let Some(caps) = re_warn_plain.captures(&stripped) {
+            let msg = caps.get(1).unwrap().as_str();
+            if !is_nix_tool_warning(msg) {
+                out.push(make(&stripped, caps.get(1), DiagnosticKind::Warning));
+            }
             continue;
         }
         if let Some(caps) = re_trace.captures(&stripped) {
@@ -334,6 +346,42 @@ fn extract_eval_warnings(stderr: &str) -> Vec<CapturedWarning> {
     let mut seen = std::collections::HashSet::new();
     out.retain(|w| seen.insert((w.kind, w.message.clone())));
     out
+}
+
+/// True for `warning:` lines that come from Nix-the-tool (the C++ client/
+/// daemon) rather than from Nix evaluation (`builtins.warn` / `lib.warn`).
+///
+/// Newer Nix versions emit `builtins.warn` as plain `warning: <msg>` (without
+/// the `evaluation warning:` prefix that `lib.warn` via `builtins.trace`
+/// produces). We capture these plain `warning:` lines too, but filter out
+/// known Nix-the-tool warnings (substitute/download/git/cache/file operations)
+/// to avoid noise. This list is conservative — when in doubt we include the
+/// warning so real evaluation warnings are never silently dropped.
+fn is_nix_tool_warning(msg: &str) -> bool {
+    let msg = msg.trim();
+    const PREFIXES: &[&str] = &[
+        "ignoring substitute",
+        "unable to download",
+        "found empty hash",
+        "creating directory",
+        "Git tree",
+        "not committing",
+        "you don't have permission",
+        "writing manifest",
+        "copying path",
+        "downloading",
+        "skipping",
+        "updating",
+        "renaming",
+        "deleting",
+    ];
+    if PREFIXES.iter().any(|p| msg.starts_with(p)) {
+        return true;
+    }
+    msg.contains("is not signed")
+        || msg.contains("download speed")
+        || (msg.starts_with("path ") && msg.contains("is not valid"))
+        || (msg.starts_with("file ") && msg.contains("was modified"))
 }
 
 fn make(raw: &str, cap: Option<regex::Match<'_>>, kind: DiagnosticKind) -> CapturedWarning {
@@ -464,6 +512,42 @@ mod tests {
     fn ignores_nix_tool_substitute_warning() {
         let s = "warning: ignoring substitute for '/nix/store/abc' from 'https://x.cachix.org', as it's not signed\n";
         assert!(extract_eval_warnings(s).is_empty());
+    }
+
+    #[test]
+    fn captures_plain_warning_for_builtins_warn() {
+        let s =
+            "warning: stdenv.isDarwin is deprecated, use stdenv.hostPlatform.isDarwin instead\n";
+        let w = extract_eval_warnings(s);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].kind, DiagnosticKind::Warning);
+        assert_eq!(
+            w[0].message,
+            "stdenv.isDarwin is deprecated, use stdenv.hostPlatform.isDarwin instead"
+        );
+    }
+
+    #[test]
+    fn captures_plain_warning_is_linux() {
+        let s = "warning: stdenv.isLinux is deprecated, use stdenv.hostPlatform.isLinux instead\n";
+        let w = extract_eval_warnings(s);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].kind, DiagnosticKind::Warning);
+    }
+
+    #[test]
+    fn filters_nix_tool_download_warning() {
+        let s = "warning: unable to download 'https://x.cachix.org/foo.narinfo'; retrying\n";
+        assert!(extract_eval_warnings(s).is_empty());
+    }
+
+    #[test]
+    fn keeps_evaluation_warning_and_plain_warning_distinct() {
+        let s = "evaluation warning: foo is deprecated\nwarning: bar is deprecated\n";
+        let w = extract_eval_warnings(s);
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].message, "foo is deprecated");
+        assert_eq!(w[1].message, "bar is deprecated");
     }
 
     #[test]
