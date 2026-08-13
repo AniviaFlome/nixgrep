@@ -471,34 +471,42 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
         .capture_target
         .clone()
         .or_else(|| scan::default_capture_target(&base_flake, host_hint.as_deref()));
-    if cli.verbose {
-        let target_desc = resolved_target
-            .as_deref()
-            .unwrap_or("<whole flake — no auto-target found>");
-        writeln_info(
-            out,
-            &format!(
-                "running `nix build {} --dry-run --keep-going --no-eval-cache` (capture target: {})…",
-                flake, target_desc,
-            ),
-        )?;
-    } else if args.capture_target.is_none() {
-        match &resolved_target {
-            Some(t) => writeln_info(out, &format!("auto-detected capture target: {t}"))?,
-            None => writeln_info(
+    // Status/info lines go to stdout for human output but must not pollute
+    // --json (which also writes to stdout). Skip them entirely in JSON mode.
+    if !cli.json {
+        if cli.verbose {
+            let target_desc = resolved_target
+                .as_deref()
+                .unwrap_or("<whole flake — no auto-target found>");
+            writeln_info(
                 out,
-                "no --capture-target given and no nixosConfigurations/homeConfigurations found; \
-                 building the bare flake",
-            )?,
+                &format!(
+                    "running `nix build {} --dry-run --keep-going --no-eval-cache` (capture target: {})…",
+                    flake, target_desc,
+                ),
+            )?;
+        } else if args.capture_target.is_none() {
+            match &resolved_target {
+                Some(t) => writeln_info(out, &format!("auto-detected capture target: {t}"))?,
+                None => writeln_info(
+                    out,
+                    "no --capture-target given and no nixosConfigurations/homeConfigurations found; \
+                     building the bare flake",
+                )?,
+            }
         }
     }
     let warnings = scan::capture_warnings(flake, resolved_target.as_deref())?;
     if warnings.is_empty() {
-        writeln_header(out, "no evaluation warnings captured")?;
-        writeln_dim(
-            out,
-            "the build produced no `evaluation warning:` / `trace:` lines from Nix expressions.",
-        )?;
+        if !cli.json {
+            writeln_header(out, "no evaluation warnings captured")?;
+            writeln_dim(
+                out,
+                "the build produced no `evaluation warning:` / `trace:` lines from Nix expressions.",
+            )?;
+        } else {
+            writeln_json(&serde_json::json!({"mode": "scan", "warnings": []}))?;
+        }
         return Ok(());
     }
 
@@ -515,7 +523,7 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
             }
         }
     };
-    if !trigger_targets.is_empty() && args.trigger_target.is_none() {
+    if !cli.json && !trigger_targets.is_empty() && args.trigger_target.is_none() {
         writeln_info(
             out,
             &format!(
@@ -529,7 +537,7 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
     let tree = collect_tree(cli, &base_flake, out)?;
 
     let lock_graph = lock::parse(std::path::Path::new(&base_flake)).ok();
-    if cli.verbose {
+    if cli.verbose && !cli.json {
         match &lock_graph {
             Some(g) => writeln_info(
                 out,
@@ -679,7 +687,27 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
             continue;
         }
 
-        for t in &triggers_ok {
+        // Sort triggers so the most actionable ones appear first:
+        // "your config" → non-nixpkgs inputs → nixpkgs inputs. This keeps the
+        // user's own config and third-party inputs (the ones they can fix) at
+        // the top, and pushes the long tail of nixpkgs-internal consumers
+        // (which the user can only fix by updating nixpkgs) to the bottom.
+        let mut ordered: Vec<&meta::MetaTrigger> = triggers_ok.iter().collect();
+        ordered.sort_by_key(|t| trigger_priority(&t.attribution));
+
+        // Cap the displayed triggers so a generic warning (e.g. the
+        // `stdenv.isDarwin` deprecation that fires for every stdenv consumer)
+        // doesn't flood the terminal with hundreds of lines. Show the top N
+        // and summarize the rest.
+        const MAX_TRIGGERS_DISPLAY: usize = 10;
+        let display: &[&meta::MetaTrigger] = if ordered.len() > MAX_TRIGGERS_DISPLAY {
+            &ordered[..MAX_TRIGGERS_DISPLAY]
+        } else {
+            &ordered
+        };
+        let omitted = ordered.len() - display.len();
+
+        for t in display {
             let line = line_suffix(t.line);
             let is_yours = t.attribution == "your config";
             let label = if is_yours {
@@ -759,8 +787,31 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
                 }
             }
         }
+        if omitted > 0 {
+            writeln_dim(
+                out,
+                &format!(
+                    "   …and {omitted} more trigger(s) omitted (pass --json to see all)"
+                ),
+            )?;
+        }
     }
     Ok(())
+}
+
+/// Sort priority for trigger attributions — lower comes first.
+/// `your config` (0) < non-nixpkgs input (1) < nixpkgs input (2) < unknown (3).
+/// Used to surface actionable triggers above the nixpkgs-internal long tail.
+fn trigger_priority(attr: &str) -> u8 {
+    if attr == "your config" {
+        0
+    } else if is_nixpkgs_internal(attr) {
+        2
+    } else if attr.starts_with("input ") {
+        1
+    } else {
+        3
+    }
 }
 
 /// Given a trigger attribution like `input catppuccin`, return the attribution
@@ -804,10 +855,9 @@ fn source_url(
 
 /// True if an attribution refers to a nixpkgs copy (a derivation defined
 /// *inside* nixpkgs, not the consuming input). These are `input nixpkgs`,
-/// `input foo.nixpkgs`, `input foo.nixpkgs-lib`, etc. Currently used only by
-/// tests; the live trigger filter is [`is_relevant_trigger`] which subsumes
-/// this check.
-#[allow(dead_code)]
+/// `input foo.nixpkgs`, `input foo.nixpkgs-lib`, etc. Used by
+/// [`trigger_priority`] to push nixpkgs-internal consumers below actionable
+/// triggers in the scan output.
 fn is_nixpkgs_internal(attr: &str) -> bool {
     let Some(input) = attr.strip_prefix("input ") else {
         return false;
@@ -941,7 +991,7 @@ fn collect_tree<W: WriteColor>(
     flake: &str,
     out: &mut W,
 ) -> Result<archive::ArchiveTree> {
-    if cli.verbose {
+    if cli.verbose && !cli.json {
         writeln_dim(
             out,
             &format!("running `nix flake archive --json --dry-run {}`…", flake),
@@ -950,7 +1000,7 @@ fn collect_tree<W: WriteColor>(
     let tree = archive::collect(flake).map_err(|e| {
         anyhow::anyhow!("{e}\nhint: ensure your flake inputs are fetched, e.g. `nix flake lock`.")
     })?;
-    if cli.verbose {
+    if cli.verbose && !cli.json {
         writeln_dim(out, &format!("  found {} input(s)", tree.inputs.len()))?;
     }
     Ok(tree)
@@ -1084,6 +1134,15 @@ mod tests {
     #[test]
     fn correlated_nixpkgs_for_unknown() {
         assert_eq!(correlated_nixpkgs("unknown"), "");
+    }
+
+    #[test]
+    fn trigger_priority_orders_your_config_first() {
+        assert_eq!(trigger_priority("your config"), 0);
+        assert_eq!(trigger_priority("input catppuccin"), 1);
+        assert_eq!(trigger_priority("input nixpkgs"), 2);
+        assert_eq!(trigger_priority("input catppuccin.nixpkgs"), 2);
+        assert_eq!(trigger_priority("unknown"), 3);
     }
 
     #[test]
