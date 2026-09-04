@@ -10,6 +10,8 @@
 //!   * `why` runs both: locate the emitter, then locate the trigger.
 //!   * `scan` builds the flake (dry-run), captures every warning nix prints,
 //!     and attributes each one — no message argument required.
+//!   * `update` checks top-level flake inputs pinned to a commit for upstream
+//!     updates.
 
 use std::io::{self, IsTerminal, Read};
 
@@ -24,6 +26,7 @@ mod message;
 mod meta;
 mod scan;
 mod search;
+mod update;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -74,6 +77,9 @@ enum Command {
     /// target derivation is given) to the triggering input. No message arg
     /// needed; nixgrep reads the warnings straight off the build.
     Scan(ScanArgs),
+    /// Check top-level flake inputs pinned to a commit (`rev = "..."`) for
+    /// upstream updates via `git ls-remote`, and optionally update them.
+    Update(UpdateArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -165,6 +171,14 @@ struct ScanArgs {
     max: Option<usize>,
 }
 
+#[derive(Parser, Debug)]
+struct UpdateArgs {
+    /// Actually update outdated inputs (runs the suggested `nix flake`
+    /// command). Without it, only report and print the suggested command.
+    #[arg(long)]
+    update: bool,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let color = match cli.color.as_str() {
@@ -180,6 +194,7 @@ fn main() -> Result<()> {
         Command::Trigger(ref args) => run_trigger(&cli, args, &mut out),
         Command::Why(ref args) => run_why(&cli, args, &mut out),
         Command::Scan(ref args) => run_scan(&cli, args, &mut out),
+        Command::Update(ref args) => run_update(&cli, args, &mut out),
     }
 }
 
@@ -790,9 +805,7 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
         if omitted > 0 {
             writeln_dim(
                 out,
-                &format!(
-                    "   …and {omitted} more trigger(s) omitted (pass --json to see all)"
-                ),
+                &format!("   …and {omitted} more trigger(s) omitted (pass --json to see all)"),
             )?;
         }
     }
@@ -1004,6 +1017,194 @@ fn collect_tree<W: WriteColor>(
         writeln_dim(out, &format!("  found {} input(s)", tree.inputs.len()))?;
     }
     Ok(tree)
+}
+
+fn run_update<W: WriteColor>(cli: &Cli, args: &UpdateArgs, out: &mut W) -> Result<()> {
+    // `update` reads and rewrites the checkout's flake.lock, so it needs a
+    // local flake directory — not a `github:…` ref.
+    let flake_dir = std::path::Path::new(&cli.flake);
+    if !flake_dir.join("flake.lock").is_file() {
+        anyhow::bail!(
+            "no flake.lock found at {} — `update` needs a local flake checkout (e.g. `--flake ~/nix-config`)",
+            flake_dir.join("flake.lock").display()
+        );
+    }
+    let graph = lock::parse(flake_dir)?;
+    if cli.verbose && !cli.json {
+        writeln_dim(
+            out,
+            &format!(
+                "parsed flake.lock: {} top-level input(s)",
+                graph.top_level.len()
+            ),
+        )?;
+    }
+
+    let rows = update::check_top_level(&graph);
+    let planned: Vec<update::Bump> = update::bumps(&rows);
+
+    if cli.json {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let bumped = if args.update && !planned.is_empty() {
+            apply_bumps(out, &cli.flake, flake_dir, &planned)?
+        } else {
+            Vec::new()
+        };
+        let json = serde_json::json!({
+            "mode": "update",
+            "flake": cli.flake,
+            "update_applied": !bumped.is_empty(),
+            "bumped": bumped,
+            "inputs": rows.iter().map(|r| {
+                let mut v = serde_json::json!({
+                    "name": r.name,
+                    "status": r.status.label(),
+                    "locked_rev": r.locked_rev,
+                });
+                if let Some(ts) = r.locked_date {
+                    v["locked_age"] = update::format_age(now, ts).into();
+                }
+                match &r.status {
+                    update::InputStatus::Skipped(reason)
+                    | update::InputStatus::Unknown(reason) => {
+                        v["reason"] = reason.as_str().into();
+                    }
+                    _ => {}
+                }
+                if let Some(h) = &r.head {
+                    v["branch"] = h.branch.as_str().into();
+                    v["head"] = h.sha.as_str().into();
+                }
+                if let Some(u) = &r.compare_url {
+                    v["compare_url"] = u.as_str().into();
+                }
+                v
+            }).collect::<Vec<_>>(),
+        });
+        writeln_json(&json)?;
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        writeln_header(out, "no flake inputs found")?;
+        return Ok(());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut counts = (0usize, 0usize, 0usize, 0usize); // outdated, current, skipped, unknown
+    for r in &rows {
+        let locked = r
+            .locked_rev
+            .as_deref()
+            .map(update::short_rev)
+            .unwrap_or("?");
+        let age = r
+            .locked_date
+            .map(|ts| format!(" ({})", update::format_age(now, ts)))
+            .unwrap_or_default();
+        match &r.status {
+            update::InputStatus::Outdated => {
+                counts.0 += 1;
+                let head = r
+                    .head
+                    .as_ref()
+                    .map(|h| update::short_rev(&h.sha))
+                    .unwrap_or("?");
+                let branch = r.head.as_ref().map(|h| h.branch.as_str()).unwrap_or("?");
+                writeln_trigger(
+                    out,
+                    &format!("  [outdated] {}: {locked}{age} → {head} ({branch})", r.name),
+                )?;
+                if let Some(u) = &r.compare_url {
+                    writeln_dim(out, &format!("    {u}"))?;
+                }
+            }
+            update::InputStatus::UpToDate => {
+                counts.1 += 1;
+                writeln_emitter(out, &format!("  [current] {}: {locked}{age}", r.name))?;
+            }
+            update::InputStatus::Skipped(reason) => {
+                counts.2 += 1;
+                writeln_dim(out, &format!("  [skipped] {}: {reason}", r.name))?;
+            }
+            update::InputStatus::Unknown(reason) => {
+                counts.3 += 1;
+                writeln_dim(out, &format!("  [unknown] {}: {reason}", r.name))?;
+            }
+        }
+    }
+    writeln_header(
+        out,
+        &format!(
+            "{} outdated, {} current, {} skipped, {} unknown",
+            counts.0, counts.1, counts.2, counts.3
+        ),
+    )?;
+
+    if planned.is_empty() {
+        return Ok(());
+    }
+    if args.update {
+        let bumped = apply_bumps(out, &cli.flake, flake_dir, &planned)?;
+        writeln_header(
+            out,
+            &format!(
+                "updated {} input(s) — review `git diff flake.nix flake.lock`",
+                bumped.len()
+            ),
+        )?;
+    } else {
+        writeln_bold(out, "to update (in flake.nix, then `nix flake lock`):")?;
+        for b in &planned {
+            writeln_dim(out, &format!("  {}: {} → {}", b.name, b.old_rev, b.new_rev))?;
+        }
+        writeln_dim(out, "  (or re-run with `--update` to apply)")?;
+    }
+    Ok(())
+}
+
+/// Bump each planned pin in `flake.nix` and re-lock once. Returns the names
+/// that were bumped. A pin whose rev isn't literally in `flake.nix` is
+/// reported and skipped instead of failing the whole run.
+fn apply_bumps<W: WriteColor>(
+    out: &mut W,
+    flake: &str,
+    flake_dir: &std::path::Path,
+    planned: &[update::Bump],
+) -> Result<Vec<String>> {
+    let mut bumped = Vec::new();
+    for b in planned {
+        match update::bump_rev_in_flake_nix(flake_dir, &b.old_rev, &b.new_rev) {
+            Ok(n) => {
+                writeln_info(
+                    out,
+                    &format!(
+                        "bumped {}: {} → {} ({n} occurrence(s))",
+                        b.name, b.old_rev, b.new_rev
+                    ),
+                )?;
+                bumped.push(b.name.clone());
+            }
+            Err(e) => {
+                writeln_dim(out, &format!("  [skip] {}: {e}", b.name))?;
+            }
+        }
+    }
+    if bumped.is_empty() {
+        return Ok(bumped);
+    }
+    writeln_info(out, "running `nix flake lock`…")?;
+    let summary = update::relock(flake)?;
+    if !summary.is_empty() {
+        writeln_dim(out, &summary)?;
+    }
+    Ok(bumped)
 }
 
 /// Read the warning message from an explicit arg or stdin.

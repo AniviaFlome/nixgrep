@@ -1,16 +1,8 @@
 {
-  description = "A Nix-flake-based Rust development environment";
+  description = "Pinpoint which flake input causes a given nixpkgs evaluation warning/trace";
 
   inputs = {
     nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1";
-    fenix = {
-      url = "https://flakehub.com/f/nix-community/fenix/0.1";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    naersk = {
-      url = "https://flakehub.com/f/nix-community/naersk/0.1";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
     treefmt-nix = {
       url = "https://flakehub.com/f/numtide/treefmt-nix/0.1";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -32,12 +24,7 @@
           system:
           f {
             inherit system;
-            pkgs = import inputs.nixpkgs {
-              inherit system;
-              overlays = [
-                inputs.self.overlays.default
-              ];
-            };
+            pkgs = import inputs.nixpkgs { inherit system; };
           }
         );
       treefmtEval = forEachSupportedSystem (
@@ -53,18 +40,7 @@
     in
     {
       overlays.default = final: prev: {
-        rustToolchain =
-          with inputs.fenix.packages.${prev.stdenv.hostPlatform.system};
-          combine (
-            with stable;
-            [
-              clippy
-              rustc
-              cargo
-              rustfmt
-              rust-src
-            ]
-          );
+        nixgrep = self.packages.${prev.stdenv.hostPlatform.system}.default;
       };
 
       devShells = forEachSupportedSystem (
@@ -72,25 +48,35 @@
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
-              rustToolchain
+              cargo
+              rustc
+              clippy
+              rustfmt
               rust-analyzer
             ];
 
             env = {
               # Required by rust-analyzer
-              RUST_SRC_PATH = "${pkgs.rustToolchain}/lib/rustlib/src/rust/library";
+              RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             };
           };
         }
       );
 
       packages = forEachSupportedSystem (
-        { system, ... }:
-        let
-          naerskLib = inputs.naersk.lib.${system};
-        in
+        { pkgs, ... }:
         {
-          default = naerskLib.buildPackage { src = ./.; };
+          default = pkgs.rustPlatform.buildRustPackage {
+            pname = "nixgrep";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            meta = {
+              description = "Pinpoint which flake input causes a given nixpkgs evaluation warning/trace";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "nixgrep";
+            };
+          };
         }
       );
 

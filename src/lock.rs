@@ -19,6 +19,10 @@ pub struct LockNode {
     pub inputs: HashMap<String, InputRef>,
     #[serde(default)]
     pub locked: Option<LockedRef>,
+    /// What the user wrote in `flake.nix` for this input (branch vs pinned
+    /// commit). Needed by the `update` command.
+    #[serde(default)]
+    pub original: Option<OriginalRef>,
 }
 
 /// An input reference: a node-id string, a follows alias, or a path array
@@ -52,6 +56,35 @@ pub struct LockedRef {
     /// GitLab / other hosts.
     #[serde(default)]
     pub host: Option<String>,
+    /// Unix timestamp of the locked commit, if recorded.
+    #[serde(default, rename = "lastModified")]
+    pub last_modified: Option<i64>,
+}
+
+/// What the user declared in `flake.nix` for an input, as recorded in
+/// `flake.lock`. A commit-pinned input has `rev` set; a branch-following
+/// input has `ref` (or neither, meaning Nix tracks the default branch).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OriginalRef {
+    #[serde(rename = "type", default)]
+    pub ref_type: String,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Set when the input is pinned to an exact commit (`rev = "..."`).
+    #[serde(default)]
+    pub rev: Option<String>,
+    /// Branch (or tag) the input tracks, if the user specified one.
+    #[serde(default, rename = "ref")]
+    pub ref_name: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    /// For `indirect` inputs (`nixpkgs` bare id).
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// A parsed `flake.lock`, mapping dotted input names → locked refs.
@@ -59,6 +92,10 @@ pub struct LockedRef {
 pub struct LockGraph {
     /// dotted input name (e.g. `catppuccin`, `catppuccin.nixpkgs`) → locked ref.
     pub inputs: HashMap<String, LockedRef>,
+    /// dotted input name → what the user declared in `flake.nix`.
+    pub originals: HashMap<String, OriginalRef>,
+    /// Direct (top-level) input names, sorted.
+    pub top_level: Vec<String>,
 }
 
 /// Parse `flake.lock` at `<flake_dir>/flake.lock`.
@@ -80,12 +117,27 @@ pub fn parse_str(contents: &str) -> anyhow::Result<LockGraph> {
         .map_err(|e| anyhow::anyhow!("failed to parse flake.lock: {e}"))?;
 
     let mut inputs: HashMap<String, LockedRef> = HashMap::new();
+    let mut originals: HashMap<String, OriginalRef> = HashMap::new();
     let root_id = lock.root.clone();
     let nodes = &lock.nodes;
+    let mut top_level: Vec<String> = Vec::new();
     if let Some(root) = nodes.get(&root_id) {
-        walk(nodes, root, root, String::new(), &mut inputs);
+        top_level = root.inputs.keys().cloned().collect();
+        top_level.sort();
+        walk(
+            nodes,
+            root,
+            root,
+            String::new(),
+            &mut inputs,
+            &mut originals,
+        );
     }
-    Ok(LockGraph { inputs })
+    Ok(LockGraph {
+        inputs,
+        originals,
+        top_level,
+    })
 }
 
 /// Recursively walk the node graph from `node`, recording every node that has
@@ -96,6 +148,7 @@ fn walk(
     node: &LockNode,
     prefix: String,
     out: &mut HashMap<String, LockedRef>,
+    originals: &mut HashMap<String, OriginalRef>,
 ) {
     for (name, input_ref) in &node.inputs {
         let dotted = if prefix.is_empty() {
@@ -110,8 +163,11 @@ fn walk(
         if let Some(locked) = &target.locked {
             out.insert(dotted.clone(), locked.clone());
         }
+        if let Some(original) = &target.original {
+            originals.insert(dotted.clone(), original.clone());
+        }
         // Recurse into the target's own inputs.
-        walk(nodes, root, target, dotted, out);
+        walk(nodes, root, target, dotted, out, originals);
     }
 }
 
@@ -218,6 +274,7 @@ mod tests {
             rev: Some(rev.into()),
             url: None,
             host: None,
+            last_modified: None,
         }
     }
 
@@ -248,6 +305,7 @@ mod tests {
             rev: None,
             url: Some("https://x/tarball".into()),
             host: None,
+            last_modified: None,
         };
         assert!(r.url("a.nix", Some(1)).is_none());
     }
@@ -261,6 +319,7 @@ mod tests {
             rev: Some("rev".into()),
             url: None,
             host: None,
+            last_modified: None,
         };
         assert_eq!(
             r.url("a.nix", Some(5)).as_deref(),
@@ -379,5 +438,58 @@ mod tests {
         let g = parse_str(json).unwrap();
         let f = g.inputs.get("foo.nixpkgs").unwrap();
         assert_eq!(f.owner.as_deref(), Some("nixos"));
+    }
+
+    #[test]
+    fn originals_and_top_level() {
+        let json = r#"{
+            "root": "root",
+            "nodes": {
+                "root": {
+                    "inputs": {
+                        "pinned": "pinned",
+                        "floating": "floating",
+                        "tb": "tb"
+                    }
+                },
+                "pinned": {
+                    "locked": {
+                        "type": "github", "owner": "o", "repo": "r",
+                        "rev": "abc123", "lastModified": 1700000000,
+                        "narHash": "sha256-"
+                    },
+                    "original": {
+                        "type": "github", "owner": "o", "repo": "r",
+                        "rev": "abc123"
+                    }
+                },
+                "floating": {
+                    "locked": {
+                        "type": "github", "owner": "nixos", "repo": "nixpkgs",
+                        "rev": "def456", "lastModified": 1700000001,
+                        "narHash": "sha256-"
+                    },
+                    "original": {
+                        "type": "github", "owner": "nixos", "repo": "nixpkgs",
+                        "ref": "nixos-unstable"
+                    }
+                },
+                "tb": {
+                    "locked": { "type": "tarball", "url": "https://x/t.tgz", "narHash": "sha256-" },
+                    "original": { "type": "tarball", "url": "https://x/t.tgz" }
+                }
+            },
+            "version": 7
+        }"#;
+        let g = parse_str(json).unwrap();
+        assert_eq!(g.top_level, vec!["floating", "pinned", "tb"]);
+        let p = g.originals.get("pinned").unwrap();
+        assert_eq!(p.rev.as_deref(), Some("abc123"));
+        assert!(p.ref_name.is_none());
+        let f = g.originals.get("floating").unwrap();
+        assert!(f.rev.is_none());
+        assert_eq!(f.ref_name.as_deref(), Some("nixos-unstable"));
+        let locked = g.inputs.get("pinned").unwrap();
+        assert_eq!(locked.last_modified, Some(1700000000));
     }
 }

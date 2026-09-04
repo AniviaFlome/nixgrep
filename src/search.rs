@@ -6,11 +6,10 @@
 //! will find the `.nix` file + line that emits the warning. We report which
 //! flake input (or "your config") that file belongs to.
 
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{SearcherBuilder, sinks::UTF8};
+use regex::Regex;
 use walkdir::WalkDir;
 
 use crate::archive::ArchiveTree;
@@ -64,7 +63,6 @@ pub fn search(
     }
 
     let matcher = build_matcher(&needle.needle, opts.regex)?;
-    let matcher = Arc::new(matcher);
     let classifier = Classifier::new(project_root, tree);
 
     let mut hits = Vec::new();
@@ -86,23 +84,19 @@ pub fn search(
     Ok(hits)
 }
 
-fn build_matcher(needle: &str, as_regex: bool) -> anyhow::Result<grep_regex::RegexMatcher> {
+fn build_matcher(needle: &str, as_regex: bool) -> anyhow::Result<Regex> {
     let pattern = if as_regex {
         needle.to_string()
     } else {
         regex::escape(needle)
     };
-    RegexMatcherBuilder::new()
-        .case_insensitive(false)
-        .line_terminator(Some(b'\n'))
-        .build(&pattern)
-        .map_err(|e| anyhow::anyhow!("invalid search needle: {e}"))
+    Regex::new(&pattern).map_err(|e| anyhow::anyhow!("invalid search needle: {e}"))
 }
 
 fn search_dir(
     dir: &Path,
     classifier: &Classifier<'_>,
-    matcher: &Arc<grep_regex::RegexMatcher>,
+    matcher: &Regex,
     opts: &SearchOpts,
     hits: &mut Vec<Hit>,
     fallback_label: &str,
@@ -114,7 +108,10 @@ fn search_dir(
     for entry in WalkDir::new(dir)
         .follow_links(true)
         .into_iter()
-        .filter_entry(|e| !is_hidden(e.file_name()))
+        // Skip hidden files/dirs (e.g. `.git`), but never prune the search
+        // root itself: an explicitly-passed root like `.` or `~/.dotfiles`
+        // looks "hidden" by file name yet must still be searched.
+        .filter_entry(|e| e.depth() == 0 || !is_hidden(e.file_name()))
         .filter_map(Result::ok)
     {
         if !entry.file_type().is_file() {
@@ -128,7 +125,7 @@ fn search_dir(
         }
 
         let file = entry.path().to_path_buf();
-        let _ = search_file(matcher.clone(), &file, |line_no, line| {
+        let _ = search_file(matcher, &file, |line_no, line| {
             let attr = classifier.classify(&file);
             let attribution = match attr {
                 Attribution::YourConfig => "your config".to_string(),
@@ -148,27 +145,25 @@ fn search_dir(
 }
 
 /// Returns the number of matches reported from this file.
-fn search_file<F>(
-    matcher: Arc<grep_regex::RegexMatcher>,
-    file: &Path,
-    mut on_hit: F,
-) -> anyhow::Result<usize>
+fn search_file<F>(matcher: &Regex, file: &Path, mut on_hit: F) -> anyhow::Result<usize>
 where
     F: FnMut(u64, &str) -> bool, // returns true to stop searching this file
 {
+    // Skip non-UTF8 / binary files without failing the whole search.
+    let content = match fs::read_to_string(file) {
+        Ok(c) => c,
+        Err(_) => return Ok(0),
+    };
     let mut count = 0usize;
-    let mut searcher = SearcherBuilder::new().line_number(true).build();
-    searcher.search_path(
-        &*matcher,
-        file,
-        UTF8(|line_no, line| {
+    for (idx, line) in content.lines().enumerate() {
+        if matcher.is_match(line) {
             count += 1;
-            if on_hit(line_no, line) {
-                return Ok(false); // stop
+            // Lines are 1-based to match grep-searcher numbering.
+            if on_hit(idx as u64 + 1, line) {
+                break;
             }
-            Ok(true) // continue
-        }),
-    )?;
+        }
+    }
     Ok(count)
 }
 
@@ -239,6 +234,37 @@ mod tests {
         };
         let hits = search(Some(&tmp), &tree, &needle, &opts).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn hidden_named_root_is_still_searched() {
+        // Regression test: the hidden-file filter must not prune the search
+        // root itself. A root like `.` (the `--flake` default) or an
+        // explicitly-passed hidden dir looks "hidden" by file name but must
+        // still be searched; only hidden *children* are skipped.
+        let tmp = std::env::temp_dir().join(format!(
+            ".nixgrep-hidden-root-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("mod.nix"), "lib.warn \"hidden root probe\" x\n").unwrap();
+
+        let tree = ArchiveTree {
+            inputs: vec![],
+            root_path: Some(tmp.clone()),
+        };
+        let needle = Normalized {
+            message: "hidden root probe".into(),
+            needle: "hidden root probe".into(),
+            partial: false,
+        };
+        let hits = search(Some(&tmp), &tree, &needle, &SearchOpts::default()).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].attribution, "your config");
     }
 
     fn tempfile_dir() -> PathBuf {

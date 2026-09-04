@@ -2,8 +2,31 @@
 
 Find which flake input causes a Nix evaluation warning or trace.
 
+## Install
+
+Try it without installing:
+
 ```sh
 nix run github:AniviaFlome/nixgrep -- scan /path/to/your/nix-config
+```
+
+Install, as a flake input:
+
+```nix
+inputs.nixgrep.url = "github:AniviaFlome/nixgrep";
+```
+
+Via the overlay (exposes it as `pkgs.nixgrep`):
+
+```nix
+nixpkgs.overlays = [ inputs.nixgrep.overlays.default ];
+environment.systemPackages = [ pkgs.nixgrep ];
+```
+
+Without the overlay, reference the package directly:
+
+```nix
+environment.systemPackages = [ inputs.nixgrep.packages.${stdenv.hostPlatform.system}.default ];
 ```
 
 ## Commands
@@ -13,6 +36,7 @@ nix run github:AniviaFlome/nixgrep -- scan /path/to/your/nix-config
 | `scan` | Capture every warning from `nix build --dry-run`. |
 | `locate <msg>` | Find the `.nix` file + line that emits a known warning. |
 | `why <msg>` | `locate` + find which input's code triggers it. |
+| `update` | Check top-level inputs pinned to a commit for upstream updates (`--update` to apply). |
 
 ## Example
 
