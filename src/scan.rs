@@ -446,5 +446,5 @@ fn strip_ansi(s: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "scan_tests.rs"]
+#[path = "../tests/unit/scan_tests.rs"]
 mod tests;

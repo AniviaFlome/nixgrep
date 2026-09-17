@@ -70,5 +70,5 @@ fn normalize_slashes(p: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-#[path = "map_tests.rs"]
+#[path = "../tests/unit/map_tests.rs"]
 mod tests;

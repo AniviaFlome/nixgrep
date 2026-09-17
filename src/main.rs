@@ -1401,9 +1401,9 @@ fn writeln_json(v: &serde_json::Value) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "main_tests.rs"]
+#[path = "../tests/unit/main_tests.rs"]
 mod tests;
 
 #[cfg(test)]
-#[path = "main_display_path_tests.rs"]
+#[path = "../tests/unit/main_display_path_tests.rs"]
 mod display_path_tests;

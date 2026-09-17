@@ -105,5 +105,5 @@ fn walk(
 }
 
 #[cfg(test)]
-#[path = "archive_tests.rs"]
+#[path = "../tests/unit/archive_tests.rs"]
 mod tests;

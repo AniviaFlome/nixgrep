@@ -10,7 +10,7 @@ Compact repo-specific guidance for OpenCode sessions. Read this before editing.
 
 ```sh
 nix develop --command cargo test --bin nixgrep <filter> # focused tests, e.g. `update::`
-cargo test --bin nixgrep # all unit tests (one src/*_tests.rs per module, wired via #[path]); needs dev shell for cargo
+cargo test --bin nixgrep # all unit tests (one tests/unit/*_tests.rs per module, wired via #[path]); needs dev shell for cargo
 nix build .#default      # build via flake (slow: release LTO; iterate with cargo test instead)
 nix run .# -- scan .     # run locally
 nix fmt                  # treefmt (nixfmt + rustfmt)

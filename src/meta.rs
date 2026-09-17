@@ -199,5 +199,5 @@ fn attribution_label(a: Attribution<'_>) -> String {
 }
 
 #[cfg(test)]
-#[path = "meta_tests.rs"]
+#[path = "../tests/unit/meta_tests.rs"]
 mod tests;

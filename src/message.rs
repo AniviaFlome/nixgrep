@@ -139,5 +139,5 @@ fn pick_needle(msg: &str) -> (String, bool) {
 }
 
 #[cfg(test)]
-#[path = "message_tests.rs"]
+#[path = "../tests/unit/message_tests.rs"]
 mod tests;

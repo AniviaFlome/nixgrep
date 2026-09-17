@@ -395,5 +395,5 @@ pub fn relock(flake: &str) -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
-#[path = "update_tests.rs"]
+#[path = "../tests/unit/update_tests.rs"]
 mod tests;

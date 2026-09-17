@@ -344,5 +344,5 @@ fn reached(hits: &[Hit], max: Option<usize>) -> bool {
 }
 
 #[cfg(test)]
-#[path = "search_tests.rs"]
+#[path = "../tests/unit/search_tests.rs"]
 mod tests;

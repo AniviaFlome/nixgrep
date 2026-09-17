@@ -263,5 +263,5 @@ impl LockedRef {
 }
 
 #[cfg(test)]
-#[path = "lock_tests.rs"]
+#[path = "../tests/unit/lock_tests.rs"]
 mod tests;
