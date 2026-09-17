@@ -269,8 +269,9 @@ fn run_locate<W: WriteColor>(cli: &Cli, args: &LocateArgs, out: &mut W) -> Resul
 }
 
 fn run_trigger<W: WriteColor>(cli: &Cli, args: &TriggerArgs, out: &mut W) -> Result<()> {
-    let msg = read_message(args.message.as_deref())?;
-    let norm = message::normalize(&msg);
+    // Trigger attribution reads `meta.position` and needs no message text;
+    // still consume the arg/stdin so missing input errors the same way.
+    let _ = read_message(args.message.as_deref())?;
     if cli.verbose {
         writeln_header(out, "nixgrep — trigger (Mode B: meta.position attribution)")?;
         if !args.nix_args.is_empty() {
@@ -290,13 +291,7 @@ fn run_trigger<W: WriteColor>(cli: &Cli, args: &TriggerArgs, out: &mut W) -> Res
     let project_root = Some(std::path::Path::new(&cli.flake).to_path_buf());
     let tree = collect_tree(cli, &cli.flake, out)?;
 
-    let triggers = meta::collect(
-        &args.nix_args,
-        &cli.flake,
-        &norm,
-        &tree,
-        project_root.as_deref(),
-    );
+    let triggers = meta::collect(&args.nix_args, &cli.flake, &tree, project_root.as_deref());
 
     if cli.json {
         let json = match &triggers {
@@ -427,13 +422,7 @@ fn run_why<W: WriteColor>(cli: &Cli, args: &WhyArgs, out: &mut W) -> Result<()> 
         )?;
         return Ok(());
     }
-    let triggers = meta::collect(
-        &args.nix_args,
-        &cli.flake,
-        &norm,
-        &tree,
-        project_root.as_deref(),
-    );
+    let triggers = meta::collect(&args.nix_args, &cli.flake, &tree, project_root.as_deref());
 
     writeln_header(out, "\n[trigger] what caused it:")?;
     match triggers {
@@ -482,10 +471,12 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
     }
 
     let (base_flake, host_hint) = scan::split_flake_ref(flake);
+    let t_capture_target = std::time::Instant::now();
     let resolved_target = args
         .capture_target
         .clone()
         .or_else(|| scan::default_capture_target(&base_flake, host_hint.as_deref()));
+    writeln_timing(cli, out, "capture-target detection", t_capture_target)?;
     // Status/info lines go to stdout for human output but must not pollute
     // --json (which also writes to stdout). Skip them entirely in JSON mode.
     if !cli.json {
@@ -511,7 +502,14 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
             }
         }
     }
+    let t_capture = std::time::Instant::now();
     let warnings = scan::capture_warnings(flake, resolved_target.as_deref())?;
+    writeln_timing(
+        cli,
+        out,
+        "warning capture (`nix build --dry-run`)",
+        t_capture,
+    )?;
     if warnings.is_empty() {
         if !cli.json {
             writeln_header(out, "no evaluation warnings captured")?;
@@ -525,6 +523,7 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
         return Ok(());
     }
 
+    let t_trig_detect = std::time::Instant::now();
     let trigger_targets: Vec<String> = match &args.trigger_target {
         Some(t) => vec![t.clone()],
         None => {
@@ -538,6 +537,7 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
             }
         }
     };
+    writeln_timing(cli, out, "trigger-target detection", t_trig_detect)?;
     if !cli.json && !trigger_targets.is_empty() && args.trigger_target.is_none() {
         writeln_info(
             out,
@@ -549,7 +549,9 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
     }
 
     let project_root = Some(std::path::Path::new(&base_flake).to_path_buf());
+    let t_tree = std::time::Instant::now();
     let tree = collect_tree(cli, &base_flake, out)?;
+    writeln_timing(cli, out, "input tree (`nix flake archive`)", t_tree)?;
 
     let lock_graph = lock::parse(std::path::Path::new(&base_flake)).ok();
     if cli.verbose && !cli.json {
@@ -570,55 +572,76 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
     };
 
     let mut results: Vec<ScanResult> = Vec::new();
+    let mut t_search = std::time::Duration::ZERO;
+    let mut t_triggers = std::time::Duration::ZERO;
 
+    // Trigger attribution doesn't depend on the warning text (it reads
+    // `meta.position` off the trigger targets), so collect it ONCE up front
+    // instead of re-evaluating per warning. The per-target evals run in
+    // parallel; each result is cloned into the per-warning results below.
+    let t0 = std::time::Instant::now();
+    let shared_triggers: Option<Result<Vec<meta::MetaTrigger>, String>> =
+        if trigger_targets.is_empty() {
+            None
+        } else {
+            Some(collect_triggers_parallel(
+                &base_flake,
+                &trigger_targets,
+                &tree,
+                project_root.as_deref(),
+            ))
+        };
+    t_triggers += t0.elapsed();
+
+    // (kind, needle) per captured warning; empties are dropped everywhere.
+    let mut indexed_norms: Vec<(scan::DiagnosticKind, message::Normalized)> = Vec::new();
     for w in &warnings {
         let norm = message::normalize(&w.message);
         if norm.is_empty() {
             continue;
         }
-        let hits = search::search(project_root.as_deref(), &tree, &norm, &opts).unwrap_or_default();
+        indexed_norms.push((w.kind, norm));
+    }
+    let needles: Vec<message::Normalized> = indexed_norms.iter().map(|(_, n)| n.clone()).collect();
 
-        let triggers = if trigger_targets.is_empty() {
-            None
-        } else {
-            let mut merged: Vec<meta::MetaTrigger> = Vec::new();
-            let mut first_err: Option<anyhow::Error> = None;
-            for target in &trigger_targets {
-                let nix_args = vec!["eval".to_string(), target.clone()];
-                match meta::collect(
-                    &nix_args,
-                    &base_flake,
-                    &norm,
-                    &tree,
-                    project_root.as_deref(),
-                ) {
-                    Ok(mut ts) => merged.append(&mut ts),
-                    Err(e) if first_err.is_none() => first_err = Some(e),
-                    Err(_) => {}
-                }
-            }
-            // Dedupe triggers that appear in multiple target paths (e.g. the
-            // same vscode extension surfaced via `programs.vscode...extensions`
-            // and `programs.vscodium...extensions`). Key on (file, line, name)
-            // so distinct derivations at the same site are both kept.
-            let mut seen: std::collections::HashSet<(std::path::PathBuf, Option<u64>, String)> =
-                std::collections::HashSet::new();
-            merged.retain(|t| seen.insert((t.file.clone(), t.line, t.name.clone())));
-            if merged.is_empty() && first_err.is_some() {
-                Some(Err(first_err.unwrap()))
-            } else {
-                Some(Ok(merged))
-            }
-        };
+    // One walk of the closure for every needle at once (instead of one
+    // walk per warning), spread across threads.
+    let t0 = std::time::Instant::now();
+    let all_hits = if needles.is_empty() {
+        Vec::new()
+    } else {
+        match search::search_all(project_root.as_deref(), &tree, &needles, &opts) {
+            Ok(h) => h,
+            Err(_) => vec![Vec::new(); needles.len()],
+        }
+    };
+    t_search += t0.elapsed();
+
+    for ((kind, norm), hits) in indexed_norms
+        .into_iter()
+        .zip(all_hits.into_iter().chain(std::iter::repeat_with(Vec::new)))
+    {
+        // Rebuild the owned per-warning shape from the shared collection.
+        // (Cloning a few hundred small structs is free next to a nix eval.)
+        let triggers = shared_triggers
+            .clone()
+            .map(|r| r.map_err(|e| anyhow::anyhow!("{e}")));
 
         results.push(ScanResult {
-            kind: w.kind,
+            kind,
             message: norm.needle.clone(),
             partial: norm.partial,
             hits,
             triggers,
         });
     }
+    writeln_timing_total(cli, out, "emitter search (all warnings)", t_search)?;
+    writeln_timing_total(
+        cli,
+        out,
+        "trigger collection (shared, parallel)",
+        t_triggers,
+    )?;
 
     if cli.json {
         let json = serde_json::json!({
@@ -810,6 +833,63 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Evaluate every trigger target's `meta.position` probe, in parallel, and
+/// merge/dedupe into one trigger list.
+///
+/// The per-target `nix eval`s are independent (each evaluates a different
+/// attr path), so they run on scoped threads — wall time drops from the sum
+/// to roughly the slowest single eval. The merge order follows `targets`
+/// order (handles are joined in spawn order), keeping output deterministic.
+///
+/// Dedupe keys on (file, line, name): the same extension can surface via
+/// several target paths (e.g. `programs.vscode...extensions` and
+/// `programs.vscodium...extensions`), while distinct derivations defined at
+/// the same site are all kept. When every target fails, the first error is
+/// returned.
+fn collect_triggers_parallel(
+    flake: &str,
+    targets: &[String],
+    tree: &archive::ArchiveTree,
+    project_root: Option<&std::path::Path>,
+) -> Result<Vec<meta::MetaTrigger>, String> {
+    let mut merged: Vec<meta::MetaTrigger> = Vec::new();
+    let mut first_err: Option<String> = None;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|t| {
+                s.spawn(|| {
+                    let nix_args = vec!["eval".to_string(), t.clone()];
+                    meta::collect(&nix_args, flake, tree, project_root)
+                })
+            })
+            .collect();
+        for h in handles {
+            match h.join() {
+                Ok(Ok(mut ts)) => merged.append(&mut ts),
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(format!("{e:#}"));
+                    }
+                }
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some("trigger worker thread panicked".to_string());
+                    }
+                }
+            }
+        }
+    });
+    let mut seen: std::collections::HashSet<(std::path::PathBuf, Option<u64>, String)> =
+        std::collections::HashSet::new();
+    merged.retain(|t| seen.insert((t.file.clone(), t.line, t.name.clone())));
+    if merged.is_empty() && first_err.is_some() {
+        Err(first_err.unwrap())
+    } else {
+        Ok(merged)
+    }
 }
 
 /// Sort priority for trigger attributions — lower comes first.
@@ -1289,258 +1369,41 @@ fn writeln_info<W: WriteColor>(out: &mut W, s: &str) -> Result<()> {
     Ok(())
 }
 
+/// Print `stage took Xs` in `--verbose` mode (never in `--json` mode, where
+/// stdout must stay pure JSON). Used to make `scan` stage costs visible.
+fn writeln_timing<W: WriteColor>(
+    cli: &Cli,
+    out: &mut W,
+    stage: &str,
+    since: std::time::Instant,
+) -> Result<()> {
+    writeln_timing_total(cli, out, stage, since.elapsed())
+}
+
+fn writeln_timing_total<W: WriteColor>(
+    cli: &Cli,
+    out: &mut W,
+    stage: &str,
+    elapsed: std::time::Duration,
+) -> Result<()> {
+    if cli.verbose && !cli.json {
+        writeln_info(
+            out,
+            &format!("{} took {:.1}s", stage, elapsed.as_secs_f64()),
+        )?;
+    }
+    Ok(())
+}
+
 fn writeln_json(v: &serde_json::Value) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extracts_host_from_nixos_target() {
-        assert_eq!(
-            extract_host_from_target("nixosConfigurations.nixos.config.system.build.toplevel",),
-            Some("nixos".to_string()),
-        );
-    }
-
-    #[test]
-    fn extracts_host_from_other_host() {
-        assert_eq!(
-            extract_host_from_target("nixosConfigurations.vps.config.system.build.toplevel"),
-            Some("vps".to_string()),
-        );
-    }
-
-    #[test]
-    fn returns_none_for_non_nixos_target() {
-        assert_eq!(extract_host_from_target("homeConfigurations.foo"), None);
-    }
-
-    #[test]
-    fn correlated_nixpkgs_for_input() {
-        assert_eq!(
-            correlated_nixpkgs("input catppuccin"),
-            "input catppuccin.nixpkgs",
-        );
-    }
-
-    #[test]
-    fn correlated_nixpkgs_for_your_config() {
-        assert_eq!(correlated_nixpkgs("your config"), "");
-    }
-
-    #[test]
-    fn correlated_nixpkgs_for_unknown() {
-        assert_eq!(correlated_nixpkgs("unknown"), "");
-    }
-
-    #[test]
-    fn trigger_priority_orders_your_config_first() {
-        assert_eq!(trigger_priority("your config"), 0);
-        assert_eq!(trigger_priority("input catppuccin"), 1);
-        assert_eq!(trigger_priority("input nixpkgs"), 2);
-        assert_eq!(trigger_priority("input catppuccin.nixpkgs"), 2);
-        assert_eq!(trigger_priority("unknown"), 3);
-    }
-
-    #[test]
-    fn nixpkgs_internal_top_level() {
-        assert!(is_nixpkgs_internal("input nixpkgs"));
-    }
-
-    #[test]
-    fn nixpkgs_internal_nested() {
-        assert!(is_nixpkgs_internal("input catppuccin.nixpkgs"));
-    }
-
-    #[test]
-    fn nixpkgs_internal_stable() {
-        assert!(is_nixpkgs_internal("input nixpkgs-stable"));
-        assert!(is_nixpkgs_internal("input foo.nixpkgs-stable"));
-    }
-
-    #[test]
-    fn not_nixpkgs_internal_for_consumer() {
-        assert!(!is_nixpkgs_internal("input catppuccin"));
-        assert!(!is_nixpkgs_internal("your config"));
-        assert!(!is_nixpkgs_internal("unknown"));
-    }
-
-    #[test]
-    fn emitter_internal_drops_coincident_file() {
-        use std::path::Path;
-        let hit = search::Hit {
-            attribution: "input nixpkgs".into(),
-            file: Path::new("/nix/store/abc-source/pkgs/development/tools/pnpm/generic.nix")
-                .to_path_buf(),
-            line_no: 28,
-            line: r#"lib.warn "pnpm: Override nodejs-slim instead of nodejs" nodejs;"#.into(),
-        };
-        let t = meta::MetaTrigger {
-            name: "pnpm-10.29.2".into(),
-            file: Path::new("/nix/store/abc-source/pkgs/development/tools/pnpm/generic.nix")
-                .to_path_buf(),
-            line: Some(28),
-            attribution: "input nixpkgs".into(),
-        };
-        assert!(is_emitter_internal(&t, std::slice::from_ref(&hit)));
-    }
-
-    #[test]
-    fn emitter_internal_keeps_distinct_file() {
-        use std::path::Path;
-        let hit = search::Hit {
-            attribution: "input nixpkgs".into(),
-            file: Path::new("/nix/store/abc-source/pkgs/development/tools/pnpm/generic.nix")
-                .to_path_buf(),
-            line_no: 28,
-            line: r#"lib.warn "pnpm: Override nodejs-slim instead of nodejs" nodejs;"#.into(),
-        };
-        let t = meta::MetaTrigger {
-            name: "vesktop-1.6.5".into(),
-            file: Path::new("/nix/store/abc-source/pkgs/by-name/ve/vesktop/package.nix")
-                .to_path_buf(),
-            line: Some(1),
-            attribution: "input nixpkgs".into(),
-        };
-        assert!(!is_emitter_internal(&t, std::slice::from_ref(&hit)));
-    }
-
-    #[test]
-    fn warned_package_name_from_emitter_path() {
-        use std::path::Path;
-        let hit = search::Hit {
-            attribution: "input nixpkgs".into(),
-            file: Path::new("/nix/store/abc-source/pkgs/development/tools/pnpm/generic.nix")
-                .to_path_buf(),
-            line_no: 28,
-            line: String::new(),
-        };
-        assert_eq!(
-            warned_package_name(std::slice::from_ref(&hit)),
-            Some("pnpm".into())
-        );
-    }
-
-    #[test]
-    fn warned_package_name_from_by_name_path() {
-        use std::path::Path;
-        let hit = search::Hit {
-            attribution: "input nixpkgs".into(),
-            file: Path::new("/nix/store/abc-source/pkgs/by-name/ve/vesktop/package.nix")
-                .to_path_buf(),
-            line_no: 1,
-            line: String::new(),
-        };
-        assert_eq!(
-            warned_package_name(std::slice::from_ref(&hit)),
-            Some("vesktop".into()),
-        );
-    }
-
-    #[test]
-    fn warned_package_name_none_when_no_hits() {
-        assert_eq!(warned_package_name(&[]), None);
-    }
-
-    #[test]
-    fn is_relevant_trigger_keeps_when_no_emitter_hits() {
-        use std::path::Path;
-        let t = meta::MetaTrigger {
-            name: "foo".into(),
-            file: Path::new("/tmp/nonexistent-xyz/foo.nix").to_path_buf(),
-            line: None,
-            attribution: "input nixpkgs".into(),
-        };
-        assert!(is_relevant_trigger(&t, &[]));
-    }
-
-    #[test]
-    fn is_relevant_trigger_keeps_when_file_mentions_package() {
-        use std::path::Path;
-        let dir = std::env::temp_dir().join(format!(
-            "nixgrep-rel-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("package.nix");
-        std::fs::write(&file, "buildInputs = [ pnpm ];\n").unwrap();
-        let hit = search::Hit {
-            attribution: "input nixpkgs".into(),
-            file: Path::new("/nix/store/abc-source/pkgs/development/tools/pnpm/generic.nix")
-                .to_path_buf(),
-            line_no: 28,
-            line: String::new(),
-        };
-        let t = meta::MetaTrigger {
-            name: "my-pkg".into(),
-            file: file.clone(),
-            line: Some(1),
-            attribution: "input nixpkgs".into(),
-        };
-        assert!(is_relevant_trigger(&t, std::slice::from_ref(&hit)));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn is_relevant_trigger_drops_when_file_does_not_mention_package() {
-        use std::path::Path;
-        let dir = std::env::temp_dir().join(format!(
-            "nixgrep-rel-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("package.nix");
-        std::fs::write(&file, "buildInputs = [ cmake ];\n").unwrap();
-        let hit = search::Hit {
-            attribution: "input nixpkgs".into(),
-            file: Path::new("/nix/store/abc-source/pkgs/development/tools/pnpm/generic.nix")
-                .to_path_buf(),
-            line_no: 28,
-            line: String::new(),
-        };
-        let t = meta::MetaTrigger {
-            name: "my-pkg".into(),
-            file: file.clone(),
-            line: Some(1),
-            attribution: "input nixpkgs".into(),
-        };
-        assert!(!is_relevant_trigger(&t, std::slice::from_ref(&hit)));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
+#[path = "main_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod display_path_tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn display_path_multi_dash_name() {
-        let p = Path::new("/nix/store/abc123-nixfmt-classic-source/pkgs/foo.nix");
-        assert_eq!(display_path(p), "nixfmt-classic/pkgs/foo.nix");
-    }
-
-    #[test]
-    fn display_path_no_source_suffix() {
-        let p = Path::new("/nix/store/abc123-some-package/lib/x.nix");
-        assert_eq!(display_path(p), "some-package/lib/x.nix");
-    }
-
-    #[test]
-    fn display_path_non_store() {
-        let p = Path::new("/home/me/cfg/flake.nix");
-        assert_eq!(display_path(p), "/home/me/cfg/flake.nix");
-    }
-}
+#[path = "main_display_path_tests.rs"]
+mod display_path_tests;

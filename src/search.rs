@@ -93,6 +93,174 @@ fn build_matcher(needle: &str, as_regex: bool) -> anyhow::Result<Regex> {
     Regex::new(&pattern).map_err(|e| anyhow::anyhow!("invalid search needle: {e}"))
 }
 
+/// Search the closure once for *all* needles, returning one hit vec per needle
+/// (in the same order as `needles`).
+///
+/// `scan` captures several warnings per build; walking the closure
+/// (~800k `.nix` files on a large config) once per warning is pure waste.
+/// This walks each input directory once and tests every line against every
+/// needle, and searches independent input directories on separate threads
+/// (bounded by available parallelism). Result order is deterministic: the
+/// project root first, then inputs in tree order; within each, walk order.
+/// `max_results` applies per needle ("max locate hits per warning").
+pub fn search_all(
+    project_root: Option<&Path>,
+    tree: &ArchiveTree,
+    needles: &[Normalized],
+    opts: &SearchOpts,
+) -> anyhow::Result<Vec<Vec<Hit>>> {
+    if needles.iter().any(Normalized::is_empty) {
+        anyhow::bail!("empty search needle after normalizing the message");
+    }
+    let matchers: Vec<Regex> = needles
+        .iter()
+        .map(|n| build_matcher(&n.needle, opts.regex))
+        .collect::<anyhow::Result<_>>()?;
+
+    // One shard per searched directory; each is an independent walk.
+    let mut shards: Vec<(String, PathBuf)> = Vec::new();
+    if let Some(root) = project_root {
+        shards.push(("your config".to_string(), root.to_path_buf()));
+    }
+    for (name, path) in &tree.inputs {
+        shards.push((name.clone(), path.clone()));
+    }
+    if shards.is_empty() {
+        return Ok(vec![Vec::new(); needles.len()]);
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(shards.len());
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::from_iter(0..shards.len()));
+    // Slot per shard; workers fill their slot, the main thread merges in order.
+    let slots = std::sync::Mutex::new(vec![None; shards.len()]);
+
+    std::thread::scope(|s| {
+        for _ in 0..worker_count {
+            s.spawn(|| {
+                let classifier = Classifier::new(project_root, tree);
+                loop {
+                    let idx = queue.lock().unwrap().pop_front();
+                    let Some(idx) = idx else { break };
+                    let (label, dir) = &shards[idx];
+                    let mut hits = vec![Vec::new(); needles.len()];
+                    let _ = search_dir_multi(dir, &classifier, &matchers, opts, label, &mut hits);
+                    slots.lock().unwrap()[idx] = Some(hits);
+                }
+            });
+        }
+    });
+
+    let mut out = vec![Vec::new(); needles.len()];
+    for slot in slots.into_inner().unwrap().into_iter().flatten() {
+        for (i, mut hits) in slot.into_iter().enumerate() {
+            out[i].append(&mut hits);
+        }
+    }
+    if let Some(m) = opts.max_results {
+        for v in &mut out {
+            v.truncate(m);
+        }
+    }
+    Ok(out)
+}
+
+/// Walk one directory testing every line against every matcher, appending
+/// hits per needle index into `hits`.
+fn search_dir_multi(
+    dir: &Path,
+    classifier: &Classifier<'_>,
+    matchers: &[Regex],
+    opts: &SearchOpts,
+    fallback_label: &str,
+    hits: &mut [Vec<Hit>],
+) -> anyhow::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in WalkDir::new(dir)
+        .follow_links(true)
+        .into_iter()
+        // Same hidden-dir pruning as the single-needle search: skip hidden
+        // children, but never the explicitly-passed root itself.
+        .filter_entry(|e| e.depth() == 0 || !is_hidden(e.file_name()))
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if opts.nix_only && entry.path().extension().and_then(|s| s.to_str()) != Some("nix") {
+            continue;
+        }
+
+        let file = entry.path().to_path_buf();
+        // Per-needle "already hit in this file" flags: without --all, only
+        // the first match per file per needle is reported.
+        let mut file_hit = vec![false; matchers.len()];
+        let _ = search_file_multi(
+            matchers,
+            &file,
+            &mut file_hit,
+            opts,
+            |idx, line_no, line| {
+                let attr = classifier.classify(&file);
+                let attribution = match attr {
+                    Attribution::YourConfig => "your config".to_string(),
+                    Attribution::Input(n) => format!("input {n}"),
+                    Attribution::Unknown => fallback_label.to_string(),
+                };
+                hits[idx].push(Hit {
+                    attribution,
+                    file: file.clone(),
+                    line_no,
+                    line: line.to_string(),
+                });
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Test every line of `file` against every matcher, calling `on_hit` with the
+/// needle index for each reportable match.
+fn search_file_multi<F>(
+    matchers: &[Regex],
+    file: &Path,
+    file_hit: &mut [bool],
+    opts: &SearchOpts,
+    mut on_hit: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(usize, u64, &str),
+{
+    // Skip non-UTF8 / binary files without failing the whole search.
+    let content = match fs::read_to_string(file) {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+    for (idx, line) in content.lines().enumerate() {
+        for (i, m) in matchers.iter().enumerate() {
+            if file_hit[i] && !opts.all_matches {
+                continue;
+            }
+            if m.is_match(line) {
+                file_hit[i] = true;
+                // Lines are 1-based to match grep-searcher numbering.
+                on_hit(i, idx as u64 + 1, line);
+                if !opts.all_matches {
+                    // This needle is done with this file, but other
+                    // needles may still match later lines.
+                    continue;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn search_dir(
     dir: &Path,
     classifier: &Classifier<'_>,
@@ -176,107 +344,5 @@ fn reached(hits: &[Hit], max: Option<usize>) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    #[test]
-    fn finds_literal_in_dir() {
-        let tmp = tempfile_dir();
-        let f = tmp.join("generic.nix");
-        fs::write(
-            &f,
-            "let\n  x = lib.warn \"pnpm: Override nodejs-slim instead of nodejs\" nodejs;\nin x\n",
-        )
-        .unwrap();
-
-        let tree = ArchiveTree {
-            inputs: vec![],
-            root_path: Some(tmp.clone()),
-        };
-        let needle = Normalized {
-            message: "pnpm: Override nodejs-slim instead of nodejs".into(),
-            needle: "pnpm: Override nodejs-slim instead of nodejs".into(),
-            partial: false,
-        };
-        let opts = SearchOpts {
-            nix_only: true,
-            ..Default::default()
-        };
-        let hits = search(Some(&tmp), &tree, &needle, &opts).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].line_no, 2);
-        assert_eq!(hits[0].attribution, "your config");
-    }
-
-    #[test]
-    fn regex_mode_matches_pattern() {
-        let tmp = tempfile_dir();
-        fs::write(
-            tmp.join("foo.nix"),
-            "lib.warn \"${name}: is deprecated\" x\n",
-        )
-        .unwrap();
-
-        let tree = ArchiveTree {
-            inputs: vec![],
-            root_path: Some(tmp.clone()),
-        };
-        let needle = Normalized {
-            message: ": is deprecated".into(),
-            needle: "is.*deprecated".into(),
-            partial: true,
-        };
-        let opts = SearchOpts {
-            regex: true,
-            nix_only: true,
-            ..Default::default()
-        };
-        let hits = search(Some(&tmp), &tree, &needle, &opts).unwrap();
-        assert_eq!(hits.len(), 1);
-    }
-
-    #[test]
-    fn hidden_named_root_is_still_searched() {
-        // Regression test: the hidden-file filter must not prune the search
-        // root itself. A root like `.` (the `--flake` default) or an
-        // explicitly-passed hidden dir looks "hidden" by file name but must
-        // still be searched; only hidden *children* are skipped.
-        let tmp = std::env::temp_dir().join(format!(
-            ".nixgrep-hidden-root-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&tmp).unwrap();
-        fs::write(tmp.join("mod.nix"), "lib.warn \"hidden root probe\" x\n").unwrap();
-
-        let tree = ArchiveTree {
-            inputs: vec![],
-            root_path: Some(tmp.clone()),
-        };
-        let needle = Normalized {
-            message: "hidden root probe".into(),
-            needle: "hidden root probe".into(),
-            partial: false,
-        };
-        let hits = search(Some(&tmp), &tree, &needle, &SearchOpts::default()).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].attribution, "your config");
-    }
-
-    fn tempfile_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "nixgrep-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-}
+#[path = "search_tests.rs"]
+mod tests;

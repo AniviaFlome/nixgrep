@@ -27,10 +27,13 @@ impl Normalized {
 }
 
 /// Strip ANSI CSI sequences and the Nix-added prefixes
-/// (`evaluation warning:`, `warning:`, `trace:`) from a raw stderr line.
+/// (`evaluation warning:`, `warning:`, `trace:`, `error:`) from a raw stderr line.
 ///
 /// Nix itself adds these prefixes in its C++ logger; the `.nix` source only
 /// contains the bare message, so we must remove the prefix before grepping.
+/// Also strips `nh`/terminal box-drawing wrappers (`┃`, `┏`, `┗`, `┣`, `━`)
+/// so pasted `nh` output works, and the `evaluation aborted …: 'msg'`
+/// wrapper plus surrounding quotes from `abort`/`throw` lines.
 pub fn normalize(raw: &str) -> Normalized {
     let cleaned = strip_ansi(raw);
     let stripped = strip_nix_prefix(&cleaned);
@@ -50,20 +53,56 @@ fn strip_ansi(s: &str) -> String {
 }
 
 fn strip_nix_prefix(s: &str) -> String {
-    let mut trimmed = s.trim_start();
+    let mut trimmed = strip_decorative_prefix(s);
     loop {
         let mut stripped = false;
-        for p in ["evaluation warning:", "warning:", "trace:"] {
+        for p in [
+            "evaluation warning:",
+            "evaluation aborted with the following error message:",
+            "warning:",
+            "trace:",
+            "error:",
+        ] {
             if let Some(rest) = trimmed.strip_prefix(p) {
-                trimmed = rest.trim_start();
+                trimmed = strip_decorative_prefix(rest);
                 stripped = true;
                 break;
             }
         }
         if !stripped {
-            return trimmed.to_string();
+            return strip_surrounding_quotes(trimmed);
         }
     }
+}
+
+/// Strip leading `nh`/box-drawing wrappers and whitespace so pasted
+/// `nh os switch` output (`┃  error: …`, `┏━ …`) normalizes to the bare Nix
+/// message.
+fn strip_decorative_prefix(s: &str) -> &str {
+    let mut t = s.trim_start();
+    loop {
+        let next = t.trim_start_matches([
+            '┃', '┏', '┗', '┣', '┻', '┳', '━', '─', '│', '⚠', '∑', '⋮', '…', '›', '»', '·', '*',
+            '-', '#',
+        ]);
+        let next = next.trim_start();
+        if next.len() == t.len() {
+            return t;
+        }
+        t = next;
+    }
+}
+
+/// Strip one layer of surrounding single or double quotes, e.g. the `'msg'`
+/// wrapper Nix adds around `abort` messages.
+fn strip_surrounding_quotes(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 2
+        && ((t.starts_with('\'') && t.ends_with('\'')) || (t.starts_with('"') && t.ends_with('"')))
+    {
+        return t[1..t.len() - 1].trim().to_string();
+    }
+    t.to_string()
 }
 
 /// Heuristically pick the best literal needle for grepping source.
@@ -100,54 +139,5 @@ fn pick_needle(msg: &str) -> (String, bool) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strips_evaluation_warning_prefix() {
-        let n = normalize("evaluation warning: pnpm: Override nodejs-slim instead of nodejs");
-        assert_eq!(n.message, "pnpm: Override nodejs-slim instead of nodejs");
-        assert_eq!(n.needle, "pnpm: Override nodejs-slim instead of nodejs");
-        assert!(!n.partial);
-    }
-
-    #[test]
-    fn strips_trace_and_evaluation_warning_prefix() {
-        let n =
-            normalize("trace: evaluation warning: pnpm: Override nodejs-slim instead of nodejs");
-        assert_eq!(n.message, "pnpm: Override nodejs-slim instead of nodejs");
-        assert_eq!(n.needle, "pnpm: Override nodejs-slim instead of nodejs");
-        assert!(!n.partial);
-    }
-
-    #[test]
-    fn strips_warning_prefix() {
-        let n = normalize("warning: foo is deprecated");
-        assert_eq!(n.message, "foo is deprecated");
-    }
-
-    #[test]
-    fn strips_trace_prefix() {
-        let n = normalize("trace: hello world");
-        assert_eq!(n.message, "hello world");
-    }
-
-    #[test]
-    fn strips_ansi() {
-        let n = normalize("\x1b[1;35mevaluation warning:\x1b[0m colorful");
-        assert_eq!(n.message, "colorful");
-    }
-
-    #[test]
-    fn picks_fragment_for_interpolated() {
-        let n = normalize("evaluation warning: ${name}: is deprecated");
-        assert_eq!(n.needle, ": is deprecated");
-        assert!(n.partial);
-    }
-
-    #[test]
-    fn handles_empty() {
-        let n = normalize("evaluation warning:");
-        assert!(n.is_empty());
-    }
-}
+#[path = "message_tests.rs"]
+mod tests;

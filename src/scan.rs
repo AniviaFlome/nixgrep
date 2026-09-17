@@ -10,11 +10,6 @@ use std::process::Command;
 use regex::Regex;
 
 /// The kind of Nix evaluation diagnostic captured.
-///
-/// Note: `builtins.throw` produces `error: <msg>` with *no fixed prefix* — the
-/// message is arbitrary user text, indistinguishable from a generic Nix-tool
-/// `error:` line. We therefore don't capture `throw` from build output; users
-/// should pass the message explicitly to `nixgrep locate` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DiagnosticKind {
     /// `trace: evaluation warning: <msg>` / `evaluation warning: <msg>`
@@ -27,6 +22,10 @@ pub enum DiagnosticKind {
     Abort,
     /// `error: assertion failed` (from a failed `assert`).
     Assert,
+    /// `error: <msg>` alongside a `caused by explicit throw` marker
+    /// (from `builtins.throw` / `throw` in nixpkgs, e.g. removed-builder
+    /// aliases like `buildGo125Module`).
+    Throw,
 }
 
 impl DiagnosticKind {
@@ -36,6 +35,7 @@ impl DiagnosticKind {
             DiagnosticKind::Trace => "trace",
             DiagnosticKind::Abort => "abort",
             DiagnosticKind::Assert => "assert",
+            DiagnosticKind::Throw => "throw",
         }
     }
 }
@@ -165,44 +165,65 @@ pub fn default_trigger_target(flake: &str, host: &str) -> Option<String> {
 /// in priority order (editor extension lists first, then `home.packages`,
 /// then `environment.systemPackages`). Each path is relative to the flake
 /// (no `#`). See [`default_trigger_target`] for the single-target variant.
+///
+/// This runs a *single* `nix eval` whose `--apply` expression enumerates the
+/// home-manager users, builds every candidate path, and filters by existence
+/// with a pure total `hasPath` helper — instead of one `nix eval` per
+/// candidate (each of which pays full evaluation + flake-fetch overhead).
 pub fn default_trigger_targets(flake: &str, host: &str) -> Vec<String> {
     let cfg = format!("nixosConfigurations.{host}.config");
-    let editors = ["vscode", "vscodium", "vscode-fhs", "cursor"];
-
-    let hm_users = list_attr(flake, &format!("{cfg}.home-manager.users")).ok();
-    let mut out = Vec::new();
-
-    if let Some(users) = &hm_users {
-        for u in users {
-            let hm = format!("{cfg}.home-manager.users.{u}");
-            for ed in editors {
-                let path = format!("{hm}.programs.{ed}.profiles.default.extensions");
-                if attr_exists(flake, &path) {
-                    out.push(path);
-                }
-                let path = format!("{hm}.programs.{ed}.extensions");
-                if attr_exists(flake, &path) {
-                    out.push(path);
-                }
+    match probe_trigger_targets(flake, &cfg) {
+        Ok(paths) => paths.into_iter().map(|p| format!("{cfg}.{p}")).collect(),
+        Err(_) => {
+            // The batched probe failed (e.g. the config attr itself doesn't
+            // evaluate) — fall back to just systemPackages so a broken
+            // home-manager subtree doesn't wipe out every trigger.
+            let sys = format!("{cfg}.environment.systemPackages");
+            if attr_exists(flake, &sys) {
+                vec![sys]
+            } else {
+                Vec::new()
             }
         }
     }
+}
 
-    if let Some(users) = &hm_users {
-        for u in users {
-            let path = format!("{cfg}.home-manager.users.{u}.home.packages");
-            if attr_exists(flake, &path) {
-                out.push(path);
-            }
-        }
+/// Run one `nix eval` returning the existing trigger-candidate sub-paths
+/// (relative to `cfg_attr`, e.g. `nixosConfigurations.nixos.config`) as a
+/// JSON string array, in priority order.
+fn probe_trigger_targets(flake: &str, cfg_attr: &str) -> anyhow::Result<Vec<String>> {
+    // NOTE: keep in sync with the candidate list the old per-path probing
+    // used: per user × per editor × 2 shapes, then home.packages, then
+    // environment.systemPackages last.
+    const PROBE: &str = r#"
+cfg:
+let
+  hasPath = obj: path:
+    if path == [] then true
+    else builtins.isAttrs obj
+      && builtins.hasAttr (builtins.head path) obj
+      && hasPath (builtins.getAttr (builtins.head path) obj) (builtins.tail path);
+  users = builtins.attrNames (cfg.home-manager.users or {});
+  editors = ["vscode" "vscodium" "vscode-fhs" "cursor"];
+  perUser = u: builtins.concatLists (builtins.map (ed: [
+    ["home-manager" "users" u "programs" ed "profiles" "default" "extensions"]
+    ["home-manager" "users" u "programs" ed "extensions"]
+  ]) editors) ++ [[ "home-manager" "users" u "home" "packages" ]];
+  cands = builtins.concatLists (builtins.map perUser users) ++ [[ "environment" "systemPackages" ]];
+in builtins.map (p: builtins.concatStringsSep "." p) (builtins.filter (p: hasPath cfg p) cands)
+"#;
+    let target = format!("{flake}#{cfg_attr}");
+    let output = Command::new("nix")
+        .args(["eval", &target, "--apply", PROBE, "--json"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run `nix eval {target}`: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("`nix eval {target}` failed: {}", stderr.trim());
     }
-
-    let sys = format!("{cfg}.environment.systemPackages");
-    if attr_exists(flake, &sys) {
-        out.push(sys);
-    }
-
-    out
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<Vec<String>>(stdout.trim())
+        .map_err(|e| anyhow::anyhow!("failed to parse `{target}` JSON: {e}"))
 }
 
 /// Return true if `flake#<attr>` evaluates without error.
@@ -285,10 +306,15 @@ fn pick_host(hosts: &[String], hostname: Option<&str>) -> Option<String> {
 /// | `builtins.trace`/`lib.trace` | `trace: <msg>`                                  | Trace   |
 /// | `abort`           | `error: evaluation aborted with the following error message: '<msg>'` | Abort |
 /// | `assert` (failed) | `error: assertion failed`                             | Assert  |
+/// | `throw`           | `error: <msg>` *with* a `caused by explicit throw` marker elsewhere in the output | Throw |
 ///
-/// `builtins.throw` is *not* captured: it prints `error: <msg>` with no fixed
-/// prefix, so its message is indistinguishable from a generic Nix-tool `error:`
-/// line. Pass a throw message explicitly to `nixgrep locate` to attribute it.
+/// `builtins.throw` prints `error: <msg>` with no fixed prefix, so its message
+/// is indistinguishable from a generic Nix-tool `error:` line on its own. We
+/// only capture it when the output also contains an explicit-throw marker
+/// (`caused by explicit throw` / `explicit throw`), which Nix prints for
+/// evaluation throws but not for tool errors. Bare `error:` lines without
+/// that marker are still dropped. When in doubt, pass a throw message
+/// explicitly to `nixgrep locate` to attribute it.
 ///
 /// Plain `warning:` lines are captured too (newer Nix emits `builtins.warn` as
 /// `warning: <msg>` without the `evaluation warning:` prefix), but we filter
@@ -301,6 +327,7 @@ fn extract_eval_warnings(stderr: &str) -> Vec<CapturedWarning> {
     static RE_TRACE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static RE_ABORT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     static RE_ASSERT: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RE_THROW: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 
     let re_warn =
         RE_WARN.get_or_init(|| Regex::new(r"^(?:trace:\s*)?evaluation warning:\s*(.+)$").unwrap());
@@ -312,6 +339,11 @@ fn extract_eval_warnings(stderr: &str) -> Vec<CapturedWarning> {
     });
     let re_assert =
         RE_ASSERT.get_or_init(|| Regex::new(r"^\s*error:\s+assertion failed\s*$").unwrap());
+    let re_throw = RE_THROW.get_or_init(|| Regex::new(r"^\s*error:\s*(.+?)\s*$").unwrap());
+
+    // `throw` has no fixed prefix of its own — gate generic `error:` capture
+    // on Nix's explicit-throw marker so plain tool errors stay dropped.
+    let has_throw = stderr.contains("explicit throw");
 
     let mut out = Vec::new();
     for line in stderr.lines() {
@@ -341,6 +373,18 @@ fn extract_eval_warnings(stderr: &str) -> Vec<CapturedWarning> {
                 message: "assertion failed".to_string(),
                 kind: DiagnosticKind::Assert,
             });
+            continue;
+        }
+        if has_throw {
+            if let Some(caps) = re_throw.captures(&stripped) {
+                let msg = caps.get(1).unwrap().as_str().trim();
+                if !msg.is_empty()
+                    && !msg.starts_with("evaluation aborted with the following error message:")
+                    && msg != "assertion failed"
+                {
+                    out.push(make(&stripped, caps.get(1), DiagnosticKind::Throw));
+                }
+            }
         }
     }
     let mut seen = std::collections::HashSet::new();
@@ -402,244 +446,5 @@ fn strip_ansi(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn warning_with_trace_prefix() {
-        let s = "trace: evaluation warning: pnpm: Override nodejs-slim instead of nodejs\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].kind, DiagnosticKind::Warning);
-        assert_eq!(w[0].message, "pnpm: Override nodejs-slim instead of nodejs");
-    }
-
-    #[test]
-    fn warning_no_trace_prefix() {
-        let s = "evaluation warning: foo is deprecated\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].kind, DiagnosticKind::Warning);
-        assert_eq!(w[0].message, "foo is deprecated");
-    }
-
-    #[test]
-    fn warning_with_ansi() {
-        let s = "\x1b[1;35mevaluation warning:\x1b[0m colorful\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].kind, DiagnosticKind::Warning);
-        assert_eq!(w[0].message, "colorful");
-    }
-
-    #[test]
-    fn warning_empty_message_kept_as_empty() {
-        let s = "trace: evaluation warning: \n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].kind, DiagnosticKind::Warning);
-        assert_eq!(w[0].message, "");
-    }
-
-    #[test]
-    fn trace_bare() {
-        let s = "trace: building something\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].kind, DiagnosticKind::Trace);
-        assert_eq!(w[0].message, "building something");
-    }
-
-    #[test]
-    fn trace_does_not_swallow_evaluation_warning() {
-        let s = "trace: evaluation warning: real warn\ntrace: plain trace\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 2);
-        assert_eq!(w[0].kind, DiagnosticKind::Warning);
-        assert_eq!(w[0].message, "real warn");
-        assert_eq!(w[1].kind, DiagnosticKind::Trace);
-        assert_eq!(w[1].message, "plain trace");
-    }
-
-    #[test]
-    fn throw_message_not_captured() {
-        let s = "error: thrown error: package XYZ is broken\n";
-        assert!(extract_eval_warnings(s).is_empty());
-    }
-
-    #[test]
-    fn throw_multiline_not_captured() {
-        let s = "error:\n       … while calling the 'import' builtin\n       at foo.nix:1:1:\n\n       error: my thrown message\n";
-        assert!(extract_eval_warnings(s).is_empty());
-    }
-
-    #[test]
-    fn abort_message() {
-        let s = "error: evaluation aborted with the following error message: 'my abort message'\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].kind, DiagnosticKind::Abort);
-        assert_eq!(w[0].message, "my abort message");
-    }
-
-    #[test]
-    fn abort_with_quotes_in_message() {
-        let s = "error: evaluation aborted with the following error message: 'can't do \"this\"'\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].kind, DiagnosticKind::Abort);
-        assert_eq!(w[0].message, "can't do \"this\"");
-    }
-
-    #[test]
-    fn assert_failure() {
-        let s = "error: assertion failed\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].kind, DiagnosticKind::Assert);
-        assert_eq!(w[0].message, "assertion failed");
-    }
-
-    #[test]
-    fn assert_failure_with_trailing_whitespace() {
-        let s = "error: assertion failed   \n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].kind, DiagnosticKind::Assert);
-    }
-
-    #[test]
-    fn ignores_nix_tool_substitute_warning() {
-        let s = "warning: ignoring substitute for '/nix/store/abc' from 'https://x.cachix.org', as it's not signed\n";
-        assert!(extract_eval_warnings(s).is_empty());
-    }
-
-    #[test]
-    fn captures_plain_warning_for_builtins_warn() {
-        let s =
-            "warning: stdenv.isDarwin is deprecated, use stdenv.hostPlatform.isDarwin instead\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].kind, DiagnosticKind::Warning);
-        assert_eq!(
-            w[0].message,
-            "stdenv.isDarwin is deprecated, use stdenv.hostPlatform.isDarwin instead"
-        );
-    }
-
-    #[test]
-    fn captures_plain_warning_is_linux() {
-        let s = "warning: stdenv.isLinux is deprecated, use stdenv.hostPlatform.isLinux instead\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].kind, DiagnosticKind::Warning);
-    }
-
-    #[test]
-    fn filters_nix_tool_download_warning() {
-        let s = "warning: unable to download 'https://x.cachix.org/foo.narinfo'; retrying\n";
-        assert!(extract_eval_warnings(s).is_empty());
-    }
-
-    #[test]
-    fn keeps_evaluation_warning_and_plain_warning_distinct() {
-        let s = "evaluation warning: foo is deprecated\nwarning: bar is deprecated\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 2);
-        assert_eq!(w[0].message, "foo is deprecated");
-        assert_eq!(w[1].message, "bar is deprecated");
-    }
-
-    #[test]
-    fn ignores_generic_error_lines() {
-        let s = "error: unexpected fragment 'nixos' in flake reference\n";
-        assert!(extract_eval_warnings(s).is_empty());
-    }
-
-    #[test]
-    fn ignores_bare_error_word() {
-        let s = "error:\n";
-        assert!(extract_eval_warnings(s).is_empty());
-    }
-
-    #[test]
-    fn ignores_trace_prefix_only() {
-        let s = "trace:\n";
-        assert!(extract_eval_warnings(s).is_empty());
-    }
-
-    #[test]
-    fn mixed_output_classifies_all() {
-        let s = "\
-warning: ignoring substitute for '/nix/store/abc' from 'https://x', as it's not signed
-trace: evaluation warning: pnpm: Override nodejs-slim instead of nodejs
-trace: INFO: building foo
-error: thrown error: pkg broken: missing dep
-copying path '/nix/store/def' from 'https://cache.nixos.org'...
-error: evaluation aborted with the following error message: 'nope'
-error: assertion failed
-error: some unrelated nix tool error
-";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 4);
-        assert_eq!(w[0].kind, DiagnosticKind::Warning);
-        assert_eq!(w[0].message, "pnpm: Override nodejs-slim instead of nodejs");
-        assert_eq!(w[1].kind, DiagnosticKind::Trace);
-        assert_eq!(w[1].message, "INFO: building foo");
-        assert_eq!(w[2].kind, DiagnosticKind::Abort);
-        assert_eq!(w[2].message, "nope");
-        assert_eq!(w[3].kind, DiagnosticKind::Assert);
-    }
-
-    #[test]
-    fn dedupes_identical_kind_and_message() {
-        let s = "trace: evaluation warning: same\ntrace: evaluation warning: same\ntrace: evaluation warning: other\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 2);
-    }
-
-    #[test]
-    fn dedup_keeps_different_kinds_same_message() {
-        let s = "trace: same text\ntrace: evaluation warning: same text\n";
-        let w = extract_eval_warnings(s);
-        assert_eq!(w.len(), 2);
-        assert_eq!(w[0].kind, DiagnosticKind::Trace);
-        assert_eq!(w[1].kind, DiagnosticKind::Warning);
-    }
-
-    #[test]
-    fn splits_path_with_host() {
-        let (base, host) = split_flake_ref("/home/me/cfg#nixos");
-        assert_eq!(base, "/home/me/cfg");
-        assert_eq!(host.as_deref(), Some("nixos"));
-    }
-
-    #[test]
-    fn splits_github_ref() {
-        let (base, host) = split_flake_ref("github:me/c#foo");
-        assert_eq!(base, "github:me/c");
-        assert_eq!(host.as_deref(), Some("foo"));
-    }
-
-    #[test]
-    fn splits_dot_ref() {
-        let (base, host) = split_flake_ref(".#nixos");
-        assert_eq!(base, ".");
-        assert_eq!(host.as_deref(), Some("nixos"));
-    }
-
-    #[test]
-    fn splits_bare_path() {
-        let (base, host) = split_flake_ref("/home/me/cfg");
-        assert_eq!(base, "/home/me/cfg");
-        assert!(host.is_none());
-    }
-
-    #[test]
-    fn kind_labels() {
-        assert_eq!(DiagnosticKind::Warning.label(), "warning");
-        assert_eq!(DiagnosticKind::Trace.label(), "trace");
-        assert_eq!(DiagnosticKind::Abort.label(), "abort");
-        assert_eq!(DiagnosticKind::Assert.label(), "assert");
-    }
-}
+#[path = "scan_tests.rs"]
+mod tests;
