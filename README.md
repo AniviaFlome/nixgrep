@@ -35,6 +35,7 @@ environment.systemPackages = [ inputs.nixgrep.packages.${stdenv.hostPlatform.sys
 |---|---|
 | `scan` | Capture every warning from `nix build --dry-run`. |
 | `locate <msg>` | Find the `.nix` file + line that emits a known warning. |
+| `trigger <msg> -- <nix args>` | Find which input's code triggers it via `meta.position`. |
 | `why <msg>` | `locate` + find which input's code triggers it. |
 | `update` | Check top-level inputs pinned to a commit for upstream updates (`--update` to apply). |
 

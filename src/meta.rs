@@ -65,7 +65,8 @@ pub fn collect(
     })?;
 
     let probe = probe_expr();
-    let json = run_eval(&attr, flake, &probe)?;
+    let extra = passthrough_flags(nix_args);
+    let json = run_eval(&attr, flake, &probe, &extra)?;
     let probed: Vec<ProbedItem> = serde_json::from_str(&json)
         .map_err(|e| anyhow::anyhow!("failed to parse `nix eval` JSON: {e}"))?;
 
@@ -93,18 +94,54 @@ struct ProbedItem {
     position: Option<String>,
 }
 
-/// Find the first `.#...` or `foo#...` positional in the nix argv.
+/// Find the installable attr path in the nix argv, skipping flags and their
+/// values (notably `--apply <expr>`, whose Nix expression must not be mistaken
+/// for an attr). Prefers candidates that look like installables (contain
+/// `#`, or start with `.`/`/`, or are bare attr paths without whitespace).
 fn find_attr(nix_args: &[String]) -> Option<String> {
+    // Flags taking a value: skip the value as well. `--apply` is handled by
+    // run_eval itself, so its expression must never be treated as the target.
+    const VALUE_FLAGS: &[&str] = &[
+        "--apply",
+        "--override-input",
+        "--update-input",
+        "--reference-lock-file",
+        "--output-lock-file",
+        "--log-format",
+    ];
+    let mut skip_next = 0usize;
+    let mut fallback: Option<String> = None;
     for a in nix_args.iter().skip(1) {
+        if skip_next > 0 {
+            skip_next -= 1;
+            continue;
+        }
         if a == "--" {
             break;
         }
         if a.starts_with('-') {
+            if a == "--override-input" {
+                skip_next = 2;
+            } else if VALUE_FLAGS.contains(&a.as_str()) {
+                skip_next = 1;
+            }
             continue;
         }
-        return Some(a.clone());
+        // Skip Nix expressions: they contain whitespace/newlines or start
+        // with `{`/`(` — installables never do.
+        if a.contains('\n') || a.contains(' ') || a.starts_with('{') || a.starts_with('(') {
+            continue;
+        }
+        // Prefer installable-looking candidates; keep the first plausible
+        // bare attr as fallback.
+        if a.contains('#') || a.starts_with('.') || a.starts_with('/') || a.contains(':') {
+            return Some(a.clone());
+        }
+        if fallback.is_none() {
+            fallback = Some(a.clone());
+        }
     }
-    None
+    fallback
 }
 
 /// The Nix expression applied to the user's value to extract name+position.
@@ -137,15 +174,23 @@ x:
     .to_string()
 }
 
-fn run_eval(attr: &str, flake: &str, probe: &str) -> anyhow::Result<String> {
+fn run_eval(attr: &str, flake: &str, probe: &str, extra_args: &[String]) -> anyhow::Result<String> {
     let target = build_target(attr, flake);
-    let args = vec![
+    let mut args = vec![
         "eval".to_string(),
         target.clone(),
         "--apply".to_string(),
         probe.to_string(),
         "--json".to_string(),
     ];
+    // Forward user flags (e.g. `--impure`) so impure flakes evaluate.
+    // `--apply`/`--json` are managed above and never forwarded.
+    for a in extra_args {
+        if a == "--apply" || a == "--json" || a == "--raw" {
+            continue;
+        }
+        args.push(a.clone());
+    }
 
     let output = Command::new("nix")
         .args(&args)
@@ -164,6 +209,53 @@ fn run_eval(attr: &str, flake: &str, probe: &str) -> anyhow::Result<String> {
     Ok(s.trim().to_string())
 }
 
+/// Flags to forward from the user's `nix` invocation to our internal
+/// `nix eval` (e.g. `--impure`). The attr path, `--apply` expr, and output
+/// format flags are managed by `run_eval` and excluded here.
+fn passthrough_flags(nix_args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 1usize;
+    while i < nix_args.len() {
+        let a = &nix_args[i];
+        if a == "--" {
+            break;
+        }
+        if a == "--apply" {
+            i += 2;
+            continue;
+        }
+        if a == "--json" || a == "--raw" {
+            i += 1;
+            continue;
+        }
+        if a.starts_with('-') {
+            out.push(a.clone());
+            let take = if a == "--override-input" {
+                2
+            } else if matches!(
+                a.as_str(),
+                "--update-input"
+                    | "--reference-lock-file"
+                    | "--output-lock-file"
+                    | "--log-format"
+                    | "--option"
+            ) {
+                1
+            } else {
+                0
+            };
+            for _ in 0..take {
+                if i + 1 < nix_args.len() && !nix_args[i + 1].starts_with('-') {
+                    i += 1;
+                    out.push(nix_args[i].clone());
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Build a flake-relative target from an attr path. Bare attr paths (no
 /// `#`/`:`/`/`) get prefixed with `<flake>#`; `.#...` becomes `<flake>#...`;
 /// an explicit flake ref (contains `#` or `:` or is a path) is left alone.
@@ -179,8 +271,22 @@ fn build_target(attr: &str, flake: &str) -> String {
     }
 }
 
-/// Split `meta.position` ("path/to/file.nix:line") into (file, Some(line)).
+/// Split `meta.position` ("path/to/file.nix:line" or "path:line:col") into
+/// (file, Some(line)). A trailing `:col` is dropped; a non-numeric suffix
+/// leaves the whole string as the file with no line.
 fn split_position(pos: &str) -> Option<(PathBuf, Option<u64>)> {
+    let parts: Vec<&str> = pos.rsplit(':').collect();
+    // parts[0] is after the last ':'.
+    if parts.len() >= 2 {
+        if let Ok(line) = parts[1].parse::<u64>() {
+            if let Ok(_col) = parts[0].parse::<u64>() {
+                // file:line:col → drop col, keep line.
+                let file: Vec<&str> = pos.split(':').collect();
+                let file = file[..file.len() - 2].join(":");
+                return Some((PathBuf::from(file), Some(line)));
+            }
+        }
+    }
     if let Some((file, line)) = pos.rsplit_once(':') {
         if let Ok(n) = line.parse::<u64>() {
             return Some((PathBuf::from(file), Some(n)));

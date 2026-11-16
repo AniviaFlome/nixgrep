@@ -163,11 +163,76 @@ fn bump_rewrites_pin_in_flake_nix() {
         format!("{{\n  inputs.naersk.url = \"github:nix-community/naersk/{old}\";\n}}\n"),
     )
     .unwrap();
-    let count = bump_rev_in_flake_nix(&dir, old, new).unwrap();
+    let count = bump_rev_in_flake_nix(&dir, "naersk", old, new).unwrap();
     assert_eq!(count, 1);
     let after = std::fs::read_to_string(dir.join("flake.nix")).unwrap();
     assert!(after.contains(new));
     assert!(!after.contains(old));
     // Unknown rev → clean error, file untouched.
-    assert!(bump_rev_in_flake_nix(&dir, old, new).is_err());
+    assert!(bump_rev_in_flake_nix(&dir, "naersk", old, new).is_err());
+}
+
+#[test]
+fn bump_scoped_to_input_name() {
+    let dir = std::env::temp_dir().join(format!(
+        "nixgrep-bump-scope-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shared = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let new_a = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let new_b = "cccccccccccccccccccccccccccccccccccccccc";
+    std::fs::write(
+        dir.join("flake.nix"),
+        format!(
+            "{{\n  inputs.a.url = \"github:o/a/{shared}\";\n  inputs.b.url = \"github:o/b/{shared}\";\n}}\n"
+        ),
+    )
+    .unwrap();
+    // Bumping `a` must not touch `b`'s identical pin.
+    let n = bump_rev_in_flake_nix(&dir, "a", shared, new_a).unwrap();
+    assert_eq!(n, 1);
+    let after = std::fs::read_to_string(dir.join("flake.nix")).unwrap();
+    assert!(after.contains(new_a));
+    assert!(after.contains(shared), "b's pin must remain");
+    // Now bumping `b` works independently.
+    let n = bump_rev_in_flake_nix(&dir, "b", shared, new_b).unwrap();
+    assert_eq!(n, 1);
+    let after = std::fs::read_to_string(dir.join("flake.nix")).unwrap();
+    assert!(!after.contains(shared));
+}
+
+#[test]
+fn bump_refuses_ambiguous_global_replace() {
+    let dir = std::env::temp_dir().join(format!(
+        "nixgrep-bump-ambig-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shared = "dddddddddddddddddddddddddddddddddddddddd";
+    std::fs::write(
+        dir.join("flake.nix"),
+        format!("{{\n  x = \"{shared}\";\n  y = \"{shared}\";\n}}\n"),
+    )
+    .unwrap();
+    // No input name matches → global replace with 2 hits must refuse.
+    assert!(bump_rev_in_flake_nix(&dir, "nope", shared, "eeee").is_err());
+}
+
+#[test]
+fn git_plus_prefix_stripped() {
+    let mut g = locked("git", None, None, None);
+    g.url = Some("git+https://example.com/repo.git?ref=main".into());
+    assert_eq!(
+        remote_url(&g).as_deref(),
+        Some("https://example.com/repo.git")
+    );
 }

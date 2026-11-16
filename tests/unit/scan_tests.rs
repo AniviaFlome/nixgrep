@@ -258,3 +258,18 @@ fn kind_labels() {
     assert_eq!(DiagnosticKind::Assert.label(), "assert");
     assert_eq!(DiagnosticKind::Throw.label(), "throw");
 }
+
+#[test]
+fn warning_empty_without_trailing_space_is_warning() {
+    let s = "trace: evaluation warning:\n";
+    let w = extract_eval_warnings(s);
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0].kind, DiagnosticKind::Warning);
+    assert_eq!(w[0].message, "");
+}
+
+#[test]
+fn filters_experimental_feature_warning() {
+    let s = "warning: experimental feature 'nix-command' is disabled\n";
+    assert!(extract_eval_warnings(s).is_empty());
+}

@@ -51,7 +51,7 @@ struct Cli {
     verbose: bool,
 
     /// Color output: auto | always | never.
-    #[arg(long, global = true, default_value = "auto")]
+    #[arg(long, global = true, default_value = "auto", value_parser = ["auto", "always", "never"])]
     color: String,
 
     /// Emit results as JSON (machine-readable).
@@ -198,6 +198,57 @@ fn main() -> Result<()> {
     }
 }
 
+/// Resolve the `--flake` ref to a local directory for "your config"
+/// attribution, or None for remote refs (`github:…`, URLs, etc.).
+/// Relative paths (`.`, `./x`) are canonicalized to absolute so they match
+/// the absolute `meta.position` paths from `nix eval`.
+fn local_flake_dir(flake: &str) -> Option<std::path::PathBuf> {
+    let (base, _) = scan::split_flake_ref(flake);
+    let base = base.trim();
+    if base.is_empty() || base == "." {
+        return std::env::current_dir().ok();
+    }
+    // Remote refs contain a scheme (`github:`, `gitlab:`, `https://`, …) or
+    // are bare flakehub-style identifiers — none of these are local dirs.
+    if base.contains("://")
+        || base.starts_with("github:")
+        || base.starts_with("gitlab:")
+        || base.starts_with("sourcehut:")
+        || base.starts_with("codeberg:")
+        || base.starts_with("git+")
+        || base.starts_with("flake:")
+    {
+        return None;
+    }
+    // A base containing ':' (but not a Windows drive, N/A on Linux) with no
+    // leading '.'/'/' is a remote flake ref, not a path.
+    if base.contains(':')
+        && !base.starts_with('.')
+        && !base.starts_with('/')
+        && !base.starts_with('~')
+    {
+        return None;
+    }
+    let mut p = std::path::PathBuf::from(base);
+    // Expand a leading `~` to the home directory so `--flake ~/cfg`
+    // attributes correctly.
+    if base == "~" || base.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            p = std::path::PathBuf::from(home)
+                .join(base.trim_start_matches('~').trim_start_matches('/'));
+        }
+    }
+    // Only treat existing directories as project roots; anything else
+    // (e.g. a file ref) yields no "your config" attribution.
+    if p.is_dir() {
+        if p.is_absolute() {
+            return Some(p);
+        }
+        return std::env::current_dir().ok().map(|cwd| cwd.join(p));
+    }
+    None
+}
+
 fn run_locate<W: WriteColor>(cli: &Cli, args: &LocateArgs, out: &mut W) -> Result<()> {
     let msg = read_message(args.message.as_deref())?;
     let norm = message::normalize(&msg);
@@ -215,8 +266,9 @@ fn run_locate<W: WriteColor>(cli: &Cli, args: &LocateArgs, out: &mut W) -> Resul
         }
     }
 
-    let project_root = Some(std::path::Path::new(&cli.flake).to_path_buf());
-    let tree = collect_tree(cli, &cli.flake, out)?;
+    let (base_flake, _) = scan::split_flake_ref(&cli.flake);
+    let project_root = local_flake_dir(&base_flake);
+    let tree = collect_tree(cli, &base_flake, out)?;
 
     let opts = search::SearchOpts {
         all_matches: args.all_matches,
@@ -288,10 +340,11 @@ fn run_trigger<W: WriteColor>(cli: &Cli, args: &TriggerArgs, out: &mut W) -> Res
         anyhow::bail!("no nix command given for Mode B");
     }
 
-    let project_root = Some(std::path::Path::new(&cli.flake).to_path_buf());
-    let tree = collect_tree(cli, &cli.flake, out)?;
+    let (base_flake, _) = scan::split_flake_ref(&cli.flake);
+    let project_root = local_flake_dir(&base_flake);
+    let tree = collect_tree(cli, &base_flake, out)?;
 
-    let triggers = meta::collect(&args.nix_args, &cli.flake, &tree, project_root.as_deref());
+    let triggers = meta::collect(&args.nix_args, &base_flake, &tree, project_root.as_deref());
 
     if cli.json {
         let json = match &triggers {
@@ -386,8 +439,9 @@ fn run_why<W: WriteColor>(cli: &Cli, args: &WhyArgs, out: &mut W) -> Result<()> 
     }
 
     // Mode A first.
-    let project_root = Some(std::path::Path::new(&cli.flake).to_path_buf());
-    let tree = collect_tree(cli, &cli.flake, out)?;
+    let (base_flake, _) = scan::split_flake_ref(&cli.flake);
+    let project_root = local_flake_dir(&base_flake);
+    let tree = collect_tree(cli, &base_flake, out)?;
     let opts = search::SearchOpts {
         all_matches: args.all_matches,
         regex: args.regex,
@@ -422,7 +476,7 @@ fn run_why<W: WriteColor>(cli: &Cli, args: &WhyArgs, out: &mut W) -> Result<()> 
         )?;
         return Ok(());
     }
-    let triggers = meta::collect(&args.nix_args, &cli.flake, &tree, project_root.as_deref());
+    let triggers = meta::collect(&args.nix_args, &base_flake, &tree, project_root.as_deref());
 
     writeln_header(out, "\n[trigger] what caused it:")?;
     match triggers {
@@ -548,7 +602,7 @@ fn run_scan<W: WriteColor>(cli: &Cli, args: &ScanArgs, out: &mut W) -> Result<()
         )?;
     }
 
-    let project_root = Some(std::path::Path::new(&base_flake).to_path_buf());
+    let project_root = local_flake_dir(&base_flake);
     let t_tree = std::time::Instant::now();
     let tree = collect_tree(cli, &base_flake, out)?;
     writeln_timing(cli, out, "input tree (`nix flake archive`)", t_tree)?;
@@ -885,8 +939,12 @@ fn collect_triggers_parallel(
     let mut seen: std::collections::HashSet<(std::path::PathBuf, Option<u64>, String)> =
         std::collections::HashSet::new();
     merged.retain(|t| seen.insert((t.file.clone(), t.line, t.name.clone())));
-    if merged.is_empty() && first_err.is_some() {
-        Err(first_err.unwrap())
+    if merged.is_empty() {
+        if let Some(e) = first_err {
+            Err(e)
+        } else {
+            Ok(merged)
+        }
     } else {
         Ok(merged)
     }
@@ -911,6 +969,9 @@ fn trigger_priority(attr: &str) -> u8 {
 /// string of the nixpkgs copy that input builds against — `input catppuccin.nixpkgs`.
 /// Returns empty string for non-input triggers (e.g. "your config", "unknown").
 fn correlated_nixpkgs(trigger_attr: &str) -> String {
+    if is_nixpkgs_internal(trigger_attr) {
+        return trigger_attr.to_string();
+    }
     if let Some(input) = trigger_attr.strip_prefix("input ") {
         format!("input {input}.nixpkgs")
     } else {
@@ -956,6 +1017,7 @@ fn is_nixpkgs_internal(attr: &str) -> bool {
         return false;
     };
     input == "nixpkgs"
+        || input == "nixpkgs-lib"
         || input.ends_with(".nixpkgs")
         || input.ends_with(".nixpkgs-lib")
         || input == "nixpkgs-stable"
@@ -1007,8 +1069,8 @@ fn is_relevant_trigger(t: &meta::MetaTrigger, hits: &[search::Hit]) -> bool {
 /// keeps real consumers (vesktop, catppuccin) which reference pnpm in their
 /// own `nativeBuildInputs`.
 fn is_nixpkgs_registrar(file: &std::path::Path) -> bool {
-    file.to_string_lossy()
-        .contains("/pkgs/top-level/all-packages.nix")
+    let s = file.to_string_lossy();
+    s.contains("/pkgs/top-level/all-packages.nix") || s.contains("/pkgs/top-level/aliases.nix")
 }
 
 /// Derive the warned package's name from the emitter hit file path.
@@ -1018,6 +1080,13 @@ fn is_nixpkgs_registrar(file: &std::path::Path) -> bool {
 /// directly above the leaf file is the package name.
 fn warned_package_name(hits: &[search::Hit]) -> Option<String> {
     for h in hits {
+        // Registrar/top-level files (aliases, all-packages) don't name a
+        // package — their parent dir (`top-level`) would poison the relevance
+        // filter and drop every real consumer. Skip them.
+        let s = h.file.to_string_lossy();
+        if s.contains("/pkgs/top-level/") {
+            continue;
+        }
         if let Some(name) = h
             .file
             .parent()
@@ -1064,13 +1133,7 @@ fn extract_host_from_target(target: &str) -> Option<String> {
 /// non-nixpkgs input, then any. Shared by `run_trigger`, `run_why`, and
 /// `run_scan`.
 fn pick_trigger(ts: &[meta::MetaTrigger]) -> Option<&meta::MetaTrigger> {
-    ts.iter()
-        .find(|t| t.attribution == "your config")
-        .or_else(|| {
-            ts.iter()
-                .find(|t| !t.attribution.starts_with("input nixpkgs"))
-        })
-        .or_else(|| ts.first())
+    ts.iter().min_by_key(|t| trigger_priority(&t.attribution))
 }
 
 /// Format an optional line number as `:N` (or empty string).
@@ -1101,15 +1164,19 @@ fn collect_tree<W: WriteColor>(
 
 fn run_update<W: WriteColor>(cli: &Cli, args: &UpdateArgs, out: &mut W) -> Result<()> {
     // `update` reads and rewrites the checkout's flake.lock, so it needs a
-    // local flake directory — not a `github:…` ref.
-    let flake_dir = std::path::Path::new(&cli.flake);
+    // local flake directory — not a `github:…` ref. Strip any `#host` suffix
+    // (`--flake .#nixos` still means the local `.` checkout).
+    let (base_flake, _) = scan::split_flake_ref(&cli.flake);
+    let flake_dir = local_flake_dir(&base_flake)
+        .or_else(|| local_flake_dir(&cli.flake))
+        .unwrap_or_else(|| std::path::PathBuf::from(&base_flake));
     if !flake_dir.join("flake.lock").is_file() {
         anyhow::bail!(
             "no flake.lock found at {} — `update` needs a local flake checkout (e.g. `--flake ~/nix-config`)",
             flake_dir.join("flake.lock").display()
         );
     }
-    let graph = lock::parse(flake_dir)?;
+    let graph = lock::parse(&flake_dir)?;
     if cli.verbose && !cli.json {
         writeln_dim(
             out,
@@ -1129,7 +1196,7 @@ fn run_update<W: WriteColor>(cli: &Cli, args: &UpdateArgs, out: &mut W) -> Resul
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let bumped = if args.update && !planned.is_empty() {
-            apply_bumps(out, &cli.flake, flake_dir, &planned)?
+            apply_bumps(out, &cli.flake, &flake_dir, &planned)?
         } else {
             Vec::new()
         };
@@ -1231,7 +1298,7 @@ fn run_update<W: WriteColor>(cli: &Cli, args: &UpdateArgs, out: &mut W) -> Resul
         return Ok(());
     }
     if args.update {
-        let bumped = apply_bumps(out, &cli.flake, flake_dir, &planned)?;
+        let bumped = apply_bumps(out, &cli.flake, &flake_dir, &planned)?;
         writeln_header(
             out,
             &format!(
@@ -1260,7 +1327,7 @@ fn apply_bumps<W: WriteColor>(
 ) -> Result<Vec<String>> {
     let mut bumped = Vec::new();
     for b in planned {
-        match update::bump_rev_in_flake_nix(flake_dir, &b.old_rev, &b.new_rev) {
+        match update::bump_rev_in_flake_nix(flake_dir, &b.name, &b.old_rev, &b.new_rev) {
             Ok(n) => {
                 writeln_info(
                     out,
@@ -1280,7 +1347,8 @@ fn apply_bumps<W: WriteColor>(
         return Ok(bumped);
     }
     writeln_info(out, "running `nix flake lock`…")?;
-    let summary = update::relock(flake)?;
+    let (relock_base, _) = scan::split_flake_ref(flake);
+    let summary = update::relock(&relock_base)?;
     if !summary.is_empty() {
         writeln_dim(out, &summary)?;
     }

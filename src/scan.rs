@@ -70,7 +70,11 @@ pub fn capture_warnings(flake: &str, target: Option<&str>) -> anyhow::Result<Vec
 
     let attr = match target {
         Some(t) => {
-            if t.contains('#') || t == "." {
+            if t == "." {
+                t.to_string()
+            } else if let Some(rest) = t.strip_prefix(".#") {
+                format!("{base_flake}#{rest}")
+            } else if t.contains('#') {
                 t.to_string()
             } else {
                 format!("{base_flake}#{t}")
@@ -330,8 +334,8 @@ fn extract_eval_warnings(stderr: &str) -> Vec<CapturedWarning> {
     static RE_THROW: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
 
     let re_warn =
-        RE_WARN.get_or_init(|| Regex::new(r"^(?:trace:\s*)?evaluation warning:\s*(.+)$").unwrap());
-    let re_warn_plain = RE_WARN_PLAIN.get_or_init(|| Regex::new(r"^warning:\s*(.+)$").unwrap());
+        RE_WARN.get_or_init(|| Regex::new(r"^(?:trace:\s*)?evaluation warning:\s*(.*)$").unwrap());
+    let re_warn_plain = RE_WARN_PLAIN.get_or_init(|| Regex::new(r"^warning:\s*(.*)$").unwrap());
     let re_trace = RE_TRACE.get_or_init(|| Regex::new(r"^trace:\s+(.+)$").unwrap());
     let re_abort = RE_ABORT.get_or_init(|| {
         Regex::new(r"^\s*error:\s+evaluation aborted with the following error message:\s*'(.*)'$")
@@ -418,6 +422,10 @@ fn is_nix_tool_warning(msg: &str) -> bool {
         "updating",
         "renaming",
         "deleting",
+        "experimental feature",
+        "unknown setting",
+        "deprecated setting",
+        "flakes are deprecated",
     ];
     if PREFIXES.iter().any(|p| msg.starts_with(p)) {
         return true;

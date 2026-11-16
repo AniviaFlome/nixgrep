@@ -81,9 +81,10 @@ fn strip_nix_prefix(s: &str) -> String {
 fn strip_decorative_prefix(s: &str) -> &str {
     let mut t = s.trim_start();
     loop {
+        // Only box-drawing / `nh` wrapper glyphs — never strip `-`, `#`, `*`
+        // or `·`, which can legitimately start a warning message.
         let next = t.trim_start_matches([
-            '┃', '┏', '┗', '┣', '┻', '┳', '━', '─', '│', '⚠', '∑', '⋮', '…', '›', '»', '·', '*',
-            '-', '#',
+            '┃', '┏', '┗', '┣', '┻', '┳', '━', '─', '│', '⚠', '∑', '⋮', '…', '›', '»',
         ]);
         let next = next.trim_start();
         if next.len() == t.len() {

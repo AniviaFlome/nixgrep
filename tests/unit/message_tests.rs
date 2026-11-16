@@ -77,3 +77,10 @@ fn handles_empty() {
     let n = normalize("evaluation warning:");
     assert!(n.is_empty());
 }
+
+#[test]
+fn preserves_leading_hash_in_message() {
+    let n = normalize("# foo is deprecated");
+    assert_eq!(n.message, "# foo is deprecated");
+    assert_eq!(n.needle, "# foo is deprecated");
+}

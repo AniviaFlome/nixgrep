@@ -142,19 +142,24 @@ pub fn search_all(
             s.spawn(|| {
                 let classifier = Classifier::new(project_root, tree);
                 loop {
-                    let idx = queue.lock().unwrap().pop_front();
+                    let idx = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
                     let Some(idx) = idx else { break };
                     let (label, dir) = &shards[idx];
                     let mut hits = vec![Vec::new(); needles.len()];
                     let _ = search_dir_multi(dir, &classifier, &matchers, opts, label, &mut hits);
-                    slots.lock().unwrap()[idx] = Some(hits);
+                    slots.lock().unwrap_or_else(|e| e.into_inner())[idx] = Some(hits);
                 }
             });
         }
     });
 
     let mut out = vec![Vec::new(); needles.len()];
-    for slot in slots.into_inner().unwrap().into_iter().flatten() {
+    for slot in slots
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner())
+        .into_iter()
+        .flatten()
+    {
         for (i, mut hits) in slot.into_iter().enumerate() {
             out[i].append(&mut hits);
         }
@@ -195,12 +200,15 @@ fn search_dir_multi(
         if opts.nix_only && entry.path().extension().and_then(|s| s.to_str()) != Some("nix") {
             continue;
         }
+        if file_too_large(entry.path()) {
+            continue;
+        }
 
         let file = entry.path().to_path_buf();
         // Per-needle "already hit in this file" flags: without --all, only
         // the first match per file per needle is reported.
         let mut file_hit = vec![false; matchers.len()];
-        let _ = search_file_multi(
+        search_file_multi(
             matchers,
             &file,
             &mut file_hit,
@@ -288,12 +296,15 @@ fn search_dir(
         if opts.nix_only && entry.path().extension().and_then(|s| s.to_str()) != Some("nix") {
             continue;
         }
+        if file_too_large(entry.path()) {
+            continue;
+        }
         if reached(hits, opts.max_results) {
             return Ok(());
         }
 
         let file = entry.path().to_path_buf();
-        let _ = search_file(matcher, &file, |line_no, line| {
+        search_file(matcher, &file, |line_no, line| {
             let attr = classifier.classify(&file);
             let attribution = match attr {
                 Attribution::YourConfig => "your config".to_string(),
@@ -306,10 +317,25 @@ fn search_dir(
                 line_no,
                 line: line.to_string(),
             });
-            !opts.all_matches
+            // Stop this file after the first hit unless --all; always stop
+            // once the global max is reached (even mid-file).
+            !opts.all_matches || reached(hits, opts.max_results)
         })?;
+        if reached(hits, opts.max_results) {
+            return Ok(());
+        }
     }
     Ok(())
+}
+
+/// Skip files larger than 5 MiB — store trees can contain large generated
+/// files; reading them whole into memory risks OOM for zero benefit (warning
+/// strings live in small `.nix` sources).
+fn file_too_large(path: &Path) -> bool {
+    const MAX_BYTES: u64 = 5 * 1024 * 1024;
+    std::fs::metadata(path)
+        .map(|m| m.len() > MAX_BYTES)
+        .unwrap_or(false)
 }
 
 /// Returns the number of matches reported from this file.

@@ -52,3 +52,49 @@ fn leaves_explicit_flake_ref_alone() {
         "github:me/c#foo",
     );
 }
+
+#[test]
+fn splits_position_with_column() {
+    // Nix can emit `file:line:col`; the column is dropped, the line kept.
+    let (f, l) = split_position("/a/b.nix:12:33").unwrap();
+    assert_eq!(f, PathBuf::from("/a/b.nix"));
+    assert_eq!(l, Some(12));
+}
+
+#[test]
+fn find_attr_skips_apply_expr() {
+    let args = vec![
+        "eval".into(),
+        "--apply".into(),
+        "x: x.foo".into(),
+        ".#bar".into(),
+    ];
+    assert_eq!(find_attr(&args), Some(".#bar".into()));
+}
+
+#[test]
+fn find_attr_skips_override_input_values() {
+    let args = vec![
+        "eval".into(),
+        "--override-input".into(),
+        "nixpkgs".into(),
+        "github:nixos/nixpkgs".into(),
+        ".#foo".into(),
+    ];
+    assert_eq!(find_attr(&args), Some(".#foo".into()));
+}
+
+#[test]
+fn passthrough_keeps_impure_but_drops_apply() {
+    let args = vec![
+        "eval".into(),
+        "--impure".into(),
+        "--apply".into(),
+        "x: x".into(),
+        ".#foo".into(),
+        "--json".into(),
+    ];
+    let extra = passthrough_flags(&args);
+    assert!(extra.contains(&"--impure".to_string()));
+    assert!(!extra.iter().any(|a| a == "--apply" || a == "--json"));
+}

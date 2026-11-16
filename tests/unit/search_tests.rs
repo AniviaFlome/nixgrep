@@ -194,11 +194,13 @@ fn search_all_rejects_empty_needle() {
         needle: String::new(),
         partial: false,
     };
-    assert!(search_all(
-        Some(&tmp),
-        &tree,
-        &[norm("x"), empty],
-        &SearchOpts::default()
-    )
-    .is_err());
+    assert!(
+        search_all(
+            Some(&tmp),
+            &tree,
+            &[norm("x"), empty],
+            &SearchOpts::default()
+        )
+        .is_err()
+    );
 }

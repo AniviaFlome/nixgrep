@@ -113,12 +113,13 @@ fn parses_simple_lock() {
         c.url("pkgs/vscode/package.nix", Some(18)).as_deref(),
         Some("https://github.com/catppuccin/nix/blob/abc/pkgs/vscode/package.nix#L18")
     );
-    assert!(g
-        .inputs
-        .get("catppuccin.nixpkgs")
-        .unwrap()
-        .url("a.nix", Some(1))
-        .is_none());
+    assert!(
+        g.inputs
+            .get("catppuccin.nixpkgs")
+            .unwrap()
+            .url("a.nix", Some(1))
+            .is_none()
+    );
 }
 
 #[test]
@@ -224,4 +225,30 @@ fn originals_and_top_level() {
     assert_eq!(f.ref_name.as_deref(), Some("nixos-unstable"));
     let locked = g.inputs.get("pinned").unwrap();
     assert_eq!(locked.last_modified, Some(1700000000));
+}
+
+#[test]
+fn follows_alias_not_duplicated() {
+    let json = r#"{
+            "root": "root",
+            "nodes": {
+                "root": {
+                    "inputs": {
+                        "nixpkgs": "nixpkgs",
+                        "foo": { "follows": "nixpkgs" }
+                    }
+                },
+                "nixpkgs": {
+                    "locked": { "type": "github", "owner": "nixos", "repo": "nixpkgs", "rev": "r1" }
+                }
+            },
+            "version": 7
+        }"#;
+    let g = parse_str(json).unwrap();
+    assert!(g.inputs.contains_key("nixpkgs"));
+    assert!(
+        !g.inputs.contains_key("foo"),
+        "follows alias must not duplicate"
+    );
+    assert!(!g.originals.contains_key("foo"));
 }

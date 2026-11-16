@@ -219,3 +219,33 @@ fn is_relevant_trigger_drops_when_file_does_not_mention_package() {
     assert!(!is_relevant_trigger(&t, std::slice::from_ref(&hit)));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn nixpkgs_lib_top_level_is_internal() {
+    assert!(is_nixpkgs_internal("input nixpkgs-lib"));
+}
+
+#[test]
+fn warned_package_skips_registrar() {
+    use std::path::Path;
+    let hit = search::Hit {
+        attribution: "input nixpkgs".into(),
+        file: Path::new("/nix/store/abc-source/pkgs/top-level/aliases.nix").to_path_buf(),
+        line_no: 1,
+        line: String::new(),
+    };
+    assert_eq!(warned_package_name(std::slice::from_ref(&hit)), None);
+}
+
+#[test]
+fn local_dir_none_for_remote() {
+    assert!(local_flake_dir("github:owner/repo").is_none());
+    assert!(local_flake_dir("github:owner/repo#host").is_none());
+}
+
+#[test]
+fn local_dir_some_for_dot() {
+    // `.` canonicalizes to an absolute existing dir.
+    let d = local_flake_dir(".").unwrap();
+    assert!(d.is_absolute());
+}

@@ -124,6 +124,9 @@ pub fn parse_str(contents: &str) -> anyhow::Result<LockGraph> {
     if let Some(root) = nodes.get(&root_id) {
         top_level = root.inputs.keys().cloned().collect();
         top_level.sort();
+        // Track visited node ids to break potential reference cycles
+        // (malformed locks, adversarial inputs) instead of recursing forever.
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
         walk(
             nodes,
             root,
@@ -131,6 +134,8 @@ pub fn parse_str(contents: &str) -> anyhow::Result<LockGraph> {
             String::new(),
             &mut inputs,
             &mut originals,
+            &mut visited,
+            true,
         );
     }
     Ok(LockGraph {
@@ -141,7 +146,9 @@ pub fn parse_str(contents: &str) -> anyhow::Result<LockGraph> {
 }
 
 /// Recursively walk the node graph from `node`, recording every node that has
-/// a `locked` ref under its dotted path.
+/// a `locked` ref under its dotted path. Top-level `follows`/path aliases are
+/// skipped (they share the target's store path and would otherwise duplicate
+/// rows/URLs under the alias name). `visited` breaks reference cycles.
 fn walk(
     nodes: &HashMap<String, LockNode>,
     root: &LockNode,
@@ -149,6 +156,8 @@ fn walk(
     prefix: String,
     out: &mut HashMap<String, LockedRef>,
     originals: &mut HashMap<String, OriginalRef>,
+    visited: &mut std::collections::HashSet<String>,
+    is_root: bool,
 ) {
     for (name, input_ref) in &node.inputs {
         let dotted = if prefix.is_empty() {
@@ -156,6 +165,11 @@ fn walk(
         } else {
             format!("{prefix}.{name}")
         };
+        // A top-level follows/path alias has no store path of its own —
+        // recording it would duplicate the target under a second name.
+        if is_root && !matches!(input_ref, InputRef::Id(_)) {
+            continue;
+        }
         let target = match resolve_ref(nodes, root, input_ref) {
             Some(t) => t,
             None => continue,
@@ -167,23 +181,43 @@ fn walk(
             originals.insert(dotted.clone(), original.clone());
         }
         // Recurse into the target's own inputs.
-        walk(nodes, root, target, dotted, out, originals);
+        // Guard against cycles by node identity (pointer) — shared diamonds
+        // (two inputs sharing one nixpkgs) are still visited under both
+        // dotted prefixes because we only skip re-entry for the *same*
+        // (parent, child-name) edge already on the stack.
+        let ptr = format!("{prefix}/{name}:{:p}", target as *const LockNode);
+        if !visited.insert(ptr.clone()) {
+            continue;
+        }
+        walk(nodes, root, target, dotted, out, originals, visited, false);
+        visited.remove(&ptr);
     }
 }
 
 /// Resolve a dotted path (from the root) to a node by walking
 /// `root.inputs.<seg0> → that node's inputs.<seg1> → ...`.
 /// Each segment's ref is resolved (following Id/Follows/Path hops).
+/// Bounded depth guards against follows cycles in malformed locks.
+#[allow(dead_code)]
 fn resolve_path<'a>(
     nodes: &'a HashMap<String, LockNode>,
     root: &'a LockNode,
     segs: &[String],
 ) -> Option<&'a LockNode> {
-    if segs.is_empty() {
+    resolve_path_depth(nodes, root, segs, 0)
+}
+
+fn resolve_path_depth<'a>(
+    nodes: &'a HashMap<String, LockNode>,
+    root: &'a LockNode,
+    segs: &[String],
+    depth: usize,
+) -> Option<&'a LockNode> {
+    if depth > 32 || segs.is_empty() {
         return None;
     }
     // First segment: look up in the root's inputs and resolve the ref.
-    let mut node = resolve_ref(nodes, root, root.inputs.get(&segs[0])?)?;
+    let mut node = resolve_ref_depth(nodes, root, root.inputs.get(&segs[0])?, depth + 1)?;
     // Subsequent segments: look up in the current node's inputs.
     for seg in &segs[1..] {
         let r = node.inputs.get(seg)?;
@@ -193,9 +227,9 @@ fn resolve_path<'a>(
             InputRef::Id(id) => nodes.get(id)?,
             InputRef::Follows { follows } => {
                 let p: Vec<String> = follows.split('.').map(str::to_string).collect();
-                resolve_path(nodes, root, &p)?
+                resolve_path_depth(nodes, root, &p, depth + 1)?
             }
-            InputRef::Path(p) => resolve_path(nodes, root, p)?,
+            InputRef::Path(p) => resolve_path_depth(nodes, root, p, depth + 1)?,
         };
     }
     Some(node)
@@ -207,13 +241,25 @@ fn resolve_ref<'a>(
     root: &'a LockNode,
     input_ref: &'a InputRef,
 ) -> Option<&'a LockNode> {
+    resolve_ref_depth(nodes, root, input_ref, 0)
+}
+
+fn resolve_ref_depth<'a>(
+    nodes: &'a HashMap<String, LockNode>,
+    root: &'a LockNode,
+    input_ref: &'a InputRef,
+    depth: usize,
+) -> Option<&'a LockNode> {
+    if depth > 32 {
+        return None;
+    }
     match input_ref {
         InputRef::Id(id) => nodes.get(id),
         InputRef::Follows { follows } => {
             let p: Vec<String> = follows.split('.').map(str::to_string).collect();
-            resolve_path(nodes, root, &p)
+            resolve_path_depth(nodes, root, &p, depth + 1)
         }
-        InputRef::Path(p) => resolve_path(nodes, root, p),
+        InputRef::Path(p) => resolve_path_depth(nodes, root, p, depth + 1),
     }
 }
 

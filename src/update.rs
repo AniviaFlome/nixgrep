@@ -169,30 +169,34 @@ pub fn remote_url(locked: &LockedRef) -> Option<String> {
             locked.owner.as_deref()?,
             locked.repo.as_deref()?,
         )),
-        "git" => locked
-            .url
-            .as_deref()
-            .map(|u| u.split('?').next().unwrap_or(u).to_string()),
+        "git" => locked.url.as_deref().map(|u| {
+            // Locked `git` URLs may carry a `git+` scheme prefix and/or a
+            // `?ref=…&rev=…` query suffix; neither is valid for `git ls-remote`.
+            let u = u.strip_prefix("git+").unwrap_or(u);
+            u.split('?').next().unwrap_or(u).to_string()
+        }),
         _ => None,
     }
 }
 
 /// Ask the remote for the HEAD SHA. With `branch = None` the default branch
-/// is resolved via `--symref`.
+/// is resolved via `--symref`. A `--` separator guards against URLs that
+/// begin with `-`, and the call is bounded by a 60s timeout so a hung
+/// network can't wedge `update` forever.
 pub fn ls_remote_head(url: &str, branch: Option<&str>) -> anyhow::Result<UpstreamHead> {
     let mut cmd = Command::new("git");
     cmd.args(["ls-remote"]);
     match branch {
         Some(b) => {
+            cmd.arg("--");
             cmd.arg(url);
             cmd.arg(format!("refs/heads/{b}"));
         }
         None => {
-            cmd.args(["--symref", url, "HEAD"]);
+            cmd.args(["--symref", "--", url, "HEAD"]);
         }
     }
-    let output = cmd
-        .output()
+    let output = run_with_timeout(cmd, std::time::Duration::from_secs(60))
         .map_err(|e| anyhow::anyhow!("failed to run `git ls-remote`: {e} (is git installed?)"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -200,6 +204,32 @@ pub fn ls_remote_head(url: &str, branch: Option<&str>) -> anyhow::Result<Upstrea
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_ls_remote(&stdout, branch)
+}
+
+/// Run `cmd` to completion, killing the child if it exceeds `timeout`.
+fn run_with_timeout(
+    mut cmd: Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(_) => return child.wait_with_output(),
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("command timed out after {}s", timeout.as_secs()),
+                ));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
 }
 
 /// Parse `git ls-remote` output into an [`UpstreamHead`]. Skips peeled
@@ -346,29 +376,88 @@ pub fn bumps(rows: &[InputUpdate]) -> Vec<Bump> {
         .collect()
 }
 
-/// Replace the pinned rev with the new HEAD SHA in `<flake_dir>/flake.nix`.
-/// Returns the number of replacements. The full 40-char SHA is effectively
-/// unique, so a plain string replacement is safe; a zero count means the pin
-/// isn't a literal in `flake.nix` (exotic URL construction) and the caller
-/// should ask the user to edit by hand.
+/// Replace the pinned rev with the new HEAD SHA in `<flake_dir>/flake.nix`,
+/// scoped to the given input so two inputs sharing one SHA can't corrupt
+/// each other. Returns the number of replacements.
+///
+/// Scoping: prefer replacing `old_rev` only on lines that mention the input
+/// name (the common `inputs.<name>.url = "...<rev>"` single-line form). If no
+/// such line exists (e.g. multi-line input block), fall back to a global
+/// replace only when the rev occurs exactly once in the whole file; otherwise
+/// bail and ask the user to edit by hand. A zero count means the pin isn't a
+/// literal in `flake.nix` (exotic URL construction).
 pub fn bump_rev_in_flake_nix(
     flake_dir: &std::path::Path,
+    input_name: &str,
+    old_rev: &str,
+    new_rev: &str,
+) -> anyhow::Result<usize> {
+    bump_rev_for_input(flake_dir, Some(input_name), old_rev, new_rev)
+}
+
+/// Unscoped variant kept for tests / callers without an input name.
+/// Behaves like the old global replace but refuses to touch the file when
+/// the rev occurs more than once (ambiguous — could belong to several inputs).
+#[allow(dead_code)]
+fn bump_rev_global(
+    flake_dir: &std::path::Path,
+    old_rev: &str,
+    new_rev: &str,
+) -> anyhow::Result<usize> {
+    bump_rev_for_input(flake_dir, None, old_rev, new_rev)
+}
+
+fn bump_rev_for_input(
+    flake_dir: &std::path::Path,
+    input_name: Option<&str>,
     old_rev: &str,
     new_rev: &str,
 ) -> anyhow::Result<usize> {
     let path = flake_dir.join("flake.nix");
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
-    let count = contents.matches(old_rev).count();
-    if count == 0 {
+    // Scoped pass: only lines mentioning the input stanza
+    // (`inputs.<name>`). Matching the bare name over-matches
+    // (`github` contains `a`); the stanza prefix is precise for the common
+    // single-line `inputs.<name>.url = "...<rev>"` form.
+    if let Some(name) = input_name {
+        let stanza = format!("inputs.{name}");
+        let mut scoped = 0usize;
+        let mut out_lines: Vec<String> = Vec::new();
+        for line in contents.lines() {
+            if line.contains(&stanza) && line.contains(old_rev) {
+                scoped += line.matches(old_rev).count();
+                out_lines.push(line.replace(old_rev, new_rev));
+            } else {
+                out_lines.push(line.to_string());
+            }
+        }
+        if scoped > 0 {
+            let mut out = out_lines.join("\n");
+            if contents.ends_with('\n') {
+                out.push('\n');
+            }
+            std::fs::write(&path, out)
+                .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+            return Ok(scoped);
+        }
+    }
+    let total = contents.matches(old_rev).count();
+    if total == 0 {
         anyhow::bail!(
             "pinned rev {old_rev} not found literally in {}",
             path.display()
         );
     }
+    if total > 1 {
+        anyhow::bail!(
+            "pinned rev {old_rev} occurs {total} times in {} — refusing global replace (specify the input stanza by hand)",
+            path.display()
+        );
+    }
     std::fs::write(&path, contents.replace(old_rev, new_rev))
         .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
-    Ok(count)
+    Ok(total)
 }
 
 /// Re-lock the flake after bumping pins. Plain `nix flake lock` only
